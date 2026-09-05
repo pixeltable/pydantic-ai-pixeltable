@@ -38,7 +38,11 @@ agent = Agent(
 
 `Memory` is the short notebook (`MEMORY.md` and other path-addressed files). `Pixeltable` searches application tables. Pair them; do not store a handbook as Memory files. `ToolOutputLimits` bounds oversized tool returns.
 
-`tables` is an allowlist of table paths or directory prefixes. Omit it only for local use against the whole catalog.
+`tables` is a required allowlist of table paths or directory prefixes. Pass `tables=["*"]` to allow the whole catalog.
+
+Two `Pixeltable(...)` instances share `id="pixeltable"` and merge. Give one a different `id` if you need both. Tool names match [pydantic-ai-chdb](https://ai.pydantic.dev/capabilities/third-party/). Wrap one side in [`PrefixTools`](https://ai.pydantic.dev/capabilities/prefix-tools/) when you pair them.
+
+A YAML spec can construct `Pixeltable` (`from_spec`, with `custom_capability_types=[Pixeltable]`). `Memory(PixeltableMemoryStore)` is Python-only. The package talks to the local catalog.
 
 ## Persist Harness memory
 
@@ -67,23 +71,33 @@ Do not write paths whose first segment is `__meta__` or `__op__`.
 
 ## Search Pixeltable tables
 
-`Pixeltable` does not create tables. Point it at a chunk view (or any table) that already has an embedding index:
+`Pixeltable` does not create tables. Point it at a chunk view that already has an embedding index. In `app.py`, declare the handbook and index on a `TableModel` and create them with `pxt schema update`:
 
 ```python
 import pixeltable as pxt
-from pixeltable.functions.document import document_splitter
+import pixeltable.functions as pxtf
+from pixeltable.functions.huggingface import sentence_transformer
 
-docs = pxt.create_table("my_app.docs", {"doc": pxt.Document}, if_exists="ignore")
-chunks = pxt.create_view(
-    "my_app.doc_chunks",
-    docs,
-    iterator=document_splitter(docs.doc, separators="paragraph"),
-    if_exists="ignore",
-)
-chunks.add_embedding_index("text", embedding=your_embed_fn, if_exists="ignore")
+TableModel = pxt.model_base()
+embed_fn = sentence_transformer.using(model_id="intfloat/multilingual-e5-large-instruct")
+
+
+class Docs(TableModel, name="docs"):
+    document: pxt.Document
+
+
+class Chunks(
+    TableModel,
+    name="doc_chunks",
+    base=Docs,
+    iterator=pxtf.document.document_splitter(Docs.document, separators="paragraph"),
+):
+    __indexes__ = [pxt.EmbeddingIndex(text, embedding=embed_fn, name="chunks_embed")]  # type: ignore[name-defined]
 ```
 
-`query_table` filters with equality only (`{"status": "open"}`). `similarity_search` calls `column.similarity(string=query)`. Both cap rows and serialized characters (`max_rows`, `max_chars`). Media columns are returned as file URLs, not blobs. `read_only=False` is not implemented.
+A notebook or REPL can still call `create_table`, `create_view`, and `add_embedding_index`. Do not put those calls in `app.py`.
+
+`query_table` filters with equality only (`{"status": "open"}`). `similarity_search` calls `column.similarity(string=query)`. Both cap rows and serialized characters (`max_rows`, `max_chars`). Default columns skip media, array, and binary; a named media column comes back as a file URL, not a blob. `read_only=False` is not implemented.
 
 ## Features
 
@@ -94,7 +108,7 @@ chunks.add_embedding_index("text", embedding=your_embed_fn, if_exists="ignore")
 - Read-only catalog tools with an allowlist and row/character caps
 - `.table` escape hatch for computed columns and arbitrary queries
 
-File mutations use compare-and-set on the file row. Receipts are written after the mutation (the same two-phase pattern as Harness `FileStore`), not as one SQL transaction.
+File mutations use compare-and-set on the file row. Receipts are a second write after the mutation, not one SQL transaction and not a FileStore crash journal. A crash between those steps can raise `MemoryConflictError` on replay.
 
 ## Development
 

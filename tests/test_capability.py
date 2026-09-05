@@ -58,14 +58,23 @@ def test_read_only_false_rejected() -> None:
         Pixeltable(read_only=False)
 
 
+def test_tables_required_and_star(catalog: str) -> None:
+    with pytest.raises(ValueError, match="tables"):
+        Pixeltable()
+    names = Pixeltable(tables=["*"]).get_toolset().list_tables()["tables"]
+    assert f"{catalog}.chunks" in names
+    assert f"{catalog}.other" in names
+
+
 def test_from_spec_and_id() -> None:
-    cap = Pixeltable.from_spec(tables=["my_app.doc_chunks"], max_rows=3, max_chars=100)
+    cap = Pixeltable.from_spec(tables=["my_app.doc_chunks"], max_rows=3, max_chars=100, defer_loading=True)
     assert cap.id == "pixeltable"
     assert cap.tables == ["my_app.doc_chunks"]
     assert cap.max_rows == 3
+    assert cap.defer_loading is True
     assert cap.get_instructions() is not None
     assert "my_app.doc_chunks" in str(cap.get_instructions())
-    assert Pixeltable(guidance="").get_instructions() is None
+    assert Pixeltable(tables=["my_app.doc_chunks"], guidance="").get_instructions() is None
 
 
 def test_allowlist_exact_and_prefix(catalog: str) -> None:

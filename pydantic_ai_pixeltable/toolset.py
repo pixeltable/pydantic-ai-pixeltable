@@ -11,6 +11,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
 
 _MEDIA = frozenset({"Image", "Video", "Audio", "Document"})
+ALL_TABLES = "*"
 
 
 def _norm(path: str) -> str:
@@ -18,7 +19,7 @@ def _norm(path: str) -> str:
 
 
 def _allowed(path: str, tables: list[str] | None) -> bool:
-    if tables is None:
+    if tables is None or tables == [ALL_TABLES]:
         return True
     npath = _norm(path)
     return any(npath == _norm(entry) or npath.startswith(f"{_norm(entry)}.") for entry in tables)
@@ -133,8 +134,8 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
 
         Args:
             table: Pixeltable table path.
-            columns: Columns to return. Omit to use non-media, non-array columns.
-                Media columns are returned as file URLs.
+            columns: Columns to return. Omit to skip media, array, and binary.
+                A named media column is returned as a file URL.
             where: Equality filters mapping column name to value.
             limit: Maximum rows to return, capped by the capability.
 

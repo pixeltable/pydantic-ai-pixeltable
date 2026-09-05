@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
 
-from pydantic_ai_pixeltable.toolset import PixeltableToolset
+from pydantic_ai_pixeltable.toolset import ALL_TABLES, PixeltableToolset
 
 if TYPE_CHECKING:
     from pydantic_ai._instructions import AgentInstructions
@@ -47,7 +47,7 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
     """
 
     tables: list[str] | None = None
-    """Table paths or directory prefixes the tools may use. ``None`` is the whole catalog."""
+    """Allowlist of table paths or directory prefixes. Required. ``['*']`` is the whole catalog."""
 
     read_only: bool = True
     """Must be ``True``. Mutations are not implemented."""
@@ -71,16 +71,21 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
             raise ValueError(f"max_rows must be at least 1, got {self.max_rows}")
         if self.max_chars < 1:
             raise ValueError(f"max_chars must be at least 1, got {self.max_chars}")
-        if self.tables is not None:
-            cleaned = [entry for entry in self.tables if entry]
-            if len(cleaned) != len(self.tables):
-                raise ValueError("tables entries must be non-empty paths")
-            self.tables = list(cleaned)
+        if self.tables is None:
+            raise ValueError(
+                "Pixeltable requires tables=... (an allowlist). Pass tables=['*'] to allow the whole catalog."
+            )
+        cleaned = [entry for entry in self.tables if entry]
+        if not cleaned:
+            raise ValueError("tables must be a non-empty allowlist, or ['*'] for the whole catalog")
+        if ALL_TABLES in cleaned and cleaned != [ALL_TABLES]:
+            raise ValueError("tables=['*'] must be the only entry when allowing the whole catalog")
+        self.tables = list(cleaned)
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         if self.guidance is not None:
             return self.guidance or None
-        if self.tables:
+        if self.tables and self.tables != [ALL_TABLES]:
             allowed = ", ".join(self.tables)
             return f"{_INSTRUCTIONS} You may only use these tables or prefixes: {allowed}."
         return _INSTRUCTIONS
@@ -96,16 +101,22 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
     def from_spec(
         cls,
         *,
-        tables: Sequence[str] | None = None,
+        tables: Sequence[str],
         read_only: bool = True,
         max_rows: int = 20,
         max_chars: int = 8000,
         guidance: str | None = None,
+        id: str | None = "pixeltable",
+        description: str | None = None,
+        defer_loading: bool = False,
     ) -> Pixeltable[AgentDepsT]:
         return cls(
-            tables=list(tables) if tables is not None else None,
+            tables=list(tables),
             read_only=read_only,
             max_rows=max_rows,
             max_chars=max_chars,
             guidance=guidance,
+            id=id,
+            description=description,
+            defer_loading=defer_loading,
         )

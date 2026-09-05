@@ -34,9 +34,11 @@ class PixeltableMemoryStore:
     """Pydantic AI Harness ``MemoryStore`` persisted in a Pixeltable table.
 
     Implements ``MemoryStore`` and ``SearchableMemoryStore``. File mutations use
-    compare-and-set on the file row; operation receipts are written afterward
-    (the FileStore two-phase pattern, not one SQL transaction). Paths whose
-    first segment is ``__meta__`` or ``__op__`` are reserved.
+    compare-and-set on the file row; operation receipts are written afterward.
+    That is two-phase, not one SQL transaction, and there is no FileStore crash
+    journal. A crash between the file mutation and the ``__op__/`` insert can
+    yield ``MemoryConflictError`` on replay instead of ``replayed=True``. Paths
+    whose first segment is ``__meta__`` or ``__op__`` are reserved.
 
     Args:
         table_name: Pixeltable table path (e.g. ``'harness.memory'``).
@@ -273,13 +275,20 @@ class PixeltableMemoryStore:
         self._record_operation(t, operation, mutation)
         return mutation
 
+    def _file_query(self, t: pxt.Table, prefix: str) -> Any:
+        pred = t.kind == _KIND_FILE
+        if prefix:
+            # startswith() is typed Int, not Bool.
+            pred = pred & (t.path >= prefix) & (t.path < prefix + "\uffff")
+        return t.where(pred)
+
     def _list_paths_sync(self, prefix: str, limit: int) -> list[str]:
         validate_store_prefix(prefix)
         if limit <= 0:
             raise ValueError("limit must be positive")
         t = self._ensure_table()
-        rows = t.where(t.kind == _KIND_FILE).select(t.path).order_by(t.path).collect()
-        return [str(row["path"]) for row in rows if str(row["path"]).startswith(prefix)][:limit]
+        rows = self._file_query(t, prefix).select(t.path).order_by(t.path).limit(limit).collect()
+        return [str(row["path"]) for row in rows]
 
     def _search_sync(
         self,
@@ -294,9 +303,11 @@ class PixeltableMemoryStore:
         if not query.split() or limit <= 0 or max_files <= 0 or max_chars <= 0 or max_file_chars <= 0:
             return MemorySearchResult(matches=[], scanned=0, truncated=False)
         t = self._ensure_table()
-        rows = t.where(t.kind == _KIND_FILE).select(t.path, t.content).order_by(t.path).collect()
-        selected = [row for row in rows if str(row["path"]).startswith(prefix)]
-        scanned_rows = selected[:max_files]
+        fetched = list(
+            self._file_query(t, prefix).select(t.path, t.content).order_by(t.path).limit(max_files + 1).collect()
+        )
+        has_more = len(fetched) > max_files
+        scanned_rows = fetched[:max_files]
         files = [(str(row["path"]), (row["content"] or "")[:max_file_chars]) for row in scanned_rows]
         content_truncated = any(len(row["content"] or "") > max_file_chars for row in scanned_rows)
         result = lexical_search(
@@ -305,5 +316,5 @@ class PixeltableMemoryStore:
         return MemorySearchResult(
             matches=result.matches,
             scanned=result.scanned,
-            truncated=result.truncated or content_truncated or len(selected) > max_files,
+            truncated=result.truncated or content_truncated or has_more,
         )

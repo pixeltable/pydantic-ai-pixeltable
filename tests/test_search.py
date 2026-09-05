@@ -78,6 +78,26 @@ async def test_search_snippets_cover_tiny_and_offset_windows(store: PixeltableMe
     assert offset.matches[0].snippet.startswith("...")
 
 
+async def test_list_paths_and_search_bound_prefix_in_table(store: PixeltableMemoryStore) -> None:
+    for path, content in (
+        ("tenant-a/main/a.md", "alpha"),
+        ("tenant-a/main/b.md", "alpha"),
+        ("tenant-a/main/c.md", "alpha"),
+        ("tenant-b/main/private.md", "alpha alpha alpha"),
+    ):
+        await store.write(path, content, expected_version=None)
+
+    assert await store.list_paths("tenant-a/main/", limit=2) == ["tenant-a/main/a.md", "tenant-a/main/b.md"]
+    result = await store.search("tenant-a/main/", "alpha", limit=10, max_files=2, max_chars=200, max_file_chars=1_000)
+    assert [match.path for match in result.matches] == ["tenant-a/main/a.md", "tenant-a/main/b.md"]
+    assert result.scanned == 2
+    assert result.truncated
+    outsider = await store.search(
+        "tenant-b/main/", "alpha", limit=10, max_files=10, max_chars=200, max_file_chars=1_000
+    )
+    assert [match.path for match in outsider.matches] == ["tenant-b/main/private.md"]
+
+
 async def test_search_bounds_each_file_and_ignores_namespace_prefix(store: PixeltableMemoryStore) -> None:
     namespace = "n" * 180
     prefix = f"{namespace}/main/"
