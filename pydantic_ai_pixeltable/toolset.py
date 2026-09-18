@@ -109,6 +109,8 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         """
         t = self._open_table(table)
         metadata = t.get_metadata()
+        # pixeltable renamed the metadata key "indices" to "indexes" in 0.7.x.
+        indexes = metadata.get("indexes") or metadata.get("indices") or {}
         return {
             "table": _norm(metadata["path"]),
             "kind": metadata["kind"],
@@ -119,7 +121,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             ],
             "indexes": [
                 {"name": info["name"], "index_type": info["index_type"], "columns": info["columns"]}
-                for info in metadata["indexes"].values()
+                for info in indexes.values()
             ],
         }
 

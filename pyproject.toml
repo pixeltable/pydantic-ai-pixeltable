@@ -30,7 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "mistune>=3.0.2,<4",  # security floor for dev installs; the package does not import it
+    "mistune>=3.0.2,<4",  # pixeltable lazily requires it to parse .md pxt.Document values in tests
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.4",

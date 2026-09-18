@@ -125,7 +125,8 @@ class PixeltableMemoryStore:
             pass
         self._ensure_dirs()
         schema: dict[str, Any] = {
-            "path": pxt.String,
+            # Required: older pixeltable makes columns nullable by default and rejects a nullable primary key.
+            "path": pxt.Required[pxt.String],
             "kind": pxt.String,
             "content": pxt.String | None,
             "version": pxt.Int | None,
