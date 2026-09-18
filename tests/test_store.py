@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pixeltable as pxt
 import pytest
@@ -15,6 +16,7 @@ from pydantic_ai_harness.memory import (
 )
 
 from pydantic_ai_pixeltable import PixeltableMemoryStore
+from pydantic_ai_pixeltable.store import _insert_rows
 
 
 @pytest.fixture()
@@ -135,6 +137,74 @@ async def test_table_escape_hatch(store: PixeltableMemoryStore) -> None:
     rows = t.where(t.kind == "file").select(t.path, t.content).collect()
     assert [row["path"] for row in rows] == ["note.md"]
     assert rows[0]["content"] == "hello"
+
+
+async def test_list_and_search_omit_bookkeeping(store: PixeltableMemoryStore) -> None:
+    operation = MemoryOperation(id="run-1:call-1", fingerprint="write:a.md:alpha")
+    await store.write("a.md", "alpha", expected_version=None, operation=operation)
+    paths = await store.list_paths("", limit=50)
+    assert paths == ["a.md"]
+    assert all(not path.startswith("__") for path in paths)
+    found = await store.search("", "alpha", limit=10, max_files=10, max_chars=400, max_file_chars=1_000)
+    assert [match.path for match in found.matches] == ["a.md"]
+
+
+async def test_table_content_update_leaves_version(store: PixeltableMemoryStore) -> None:
+    created = await store.write("note.md", "hello", expected_version=None)
+    t = store.table
+    t.update({"content": "HACKED"}, where=t.path == "note.md")
+    file = await store.read("note.md", max_chars=100)
+    assert file is not None
+    assert file.content == "HACKED"
+    assert file.version == created.version
+    overwritten = await store.write("note.md", "restored", expected_version=file.version)
+    assert overwritten.existed
+    restored = await store.read("note.md", max_chars=100)
+    assert restored is not None
+    assert restored.content == "restored"
+
+
+async def test_duplicate_insert_is_conflict(store: PixeltableMemoryStore) -> None:
+    created = await store.write("race.md", "A", expected_version=None)
+    other = PixeltableMemoryStore(table_name=store._table_name)
+    with pytest.raises(MemoryConflictError):
+        await other.write("race.md", "B", expected_version=None)
+
+    with pytest.raises(MemoryConflictError, match="Duplicate primary key"):
+        _insert_rows(
+            store.table,
+            [
+                {
+                    "path": "race.md",
+                    "kind": "file",
+                    "content": "C",
+                    "version": int(created.version) + 1 if created.version else 99,
+                    "last_operation_id": None,
+                    "fingerprint": None,
+                    "existed": None,
+                }
+            ],
+        )
+
+
+async def test_concurrent_create_across_instances_is_conflict(store: PixeltableMemoryStore) -> None:
+    assert store.table is not None
+    other = PixeltableMemoryStore(table_name=store._table_name)
+
+    def create(target: PixeltableMemoryStore, content: str) -> str:
+        try:
+            target._write_sync("race.md", content, None, None)
+            return "ok"
+        except MemoryConflictError:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda pair: create(*pair), [(store, "A"), (other, "B")]))
+    assert results.count("ok") == 1
+    assert results.count("conflict") == 1
+    file = await store.read("race.md", max_chars=10)
+    assert file is not None
+    assert file.content in {"A", "B"}
 
 
 def test_implements_public_protocols(store: PixeltableMemoryStore) -> None:

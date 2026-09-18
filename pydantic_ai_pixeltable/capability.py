@@ -17,8 +17,7 @@ if TYPE_CHECKING:
 _INSTRUCTIONS = (
     "You have Pixeltable catalog tools. Call list_tables and describe_table before querying "
     "an unfamiliar table. Use similarity_search for handbook or embedding questions. Use "
-    "query_table for structured equality filters. Do not copy retrieved rows into Memory; "
-    "Memory is the short notebook, not the corpus."
+    "query_table for structured equality filters."
 )
 
 
@@ -26,22 +25,15 @@ _INSTRUCTIONS = (
 class Pixeltable(AbstractCapability[AgentDepsT]):
     """Read-only tools over existing Pixeltable tables.
 
-    Pair this with Harness ``Memory`` when the agent also keeps a notebook. This
-    capability searches application tables; ``PixeltableMemoryStore`` persists
-    ``MEMORY.md``.
+    Pair this with Harness ``Memory`` (any store) when the agent also keeps a notebook.
 
     ```python
     from pydantic_ai import Agent
-    from pydantic_ai_harness import Memory, ToolOutputLimits
-    from pydantic_ai_pixeltable import Pixeltable, PixeltableMemoryStore
+    from pydantic_ai_pixeltable import Pixeltable
 
     agent = Agent(
-        'openai:gpt-4o-mini',
-        capabilities=[
-            Memory(PixeltableMemoryStore(table_name='harness.memory')),
-            Pixeltable(tables=['my_app.doc_chunks'], read_only=True),
-            ToolOutputLimits(),
-        ],
+        "openai:gpt-4o-mini",
+        capabilities=[Pixeltable(tables=["my_app.doc_chunks"], read_only=True)],
     )
     ```
     """
@@ -71,6 +63,8 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
             raise ValueError(f"max_rows must be at least 1, got {self.max_rows}")
         if self.max_chars < 1:
             raise ValueError(f"max_chars must be at least 1, got {self.max_chars}")
+        if isinstance(self.tables, str):
+            raise ValueError("tables must be a list of paths, not a string")
         if self.tables is None:
             raise ValueError(
                 "Pixeltable requires tables=... (an allowlist). Pass tables=['*'] to allow the whole catalog."
@@ -110,6 +104,8 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
         description: str | None = None,
         defer_loading: bool = False,
     ) -> Pixeltable[AgentDepsT]:
+        if isinstance(tables, str):
+            raise ValueError("tables must be a list of paths, not a string")
         return cls(
             tables=list(tables),
             read_only=read_only,

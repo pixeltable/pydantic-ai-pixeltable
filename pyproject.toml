@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "mistune>=3.0.2,<4",  # security floor for dev installs; the package does not import it
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.4",
@@ -38,7 +39,7 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/pixeltable/pydantic-ai-pixeltable"
 Repository = "https://github.com/pixeltable/pydantic-ai-pixeltable"
-Documentation = "https://docs.pixeltable.com/libraries/pydantic-ai"
+Documentation = "https://github.com/pixeltable/pydantic-ai-pixeltable#readme"
 Issues = "https://github.com/pixeltable/pydantic-ai-pixeltable/issues"
 Discord = "https://discord.gg/QPyqFYx2UN"
 
@@ -72,5 +73,9 @@ asyncio_mode = "auto"
 addopts = [
     "--strict-config",
     "--strict-markers",
+    "-m not expensive",
+]
+markers = [
+    "expensive: long-running local volume tests",
 ]
 xfail_strict = true

@@ -2,26 +2,18 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
+from pathlib import Path
 
 import numpy as np
 import pixeltable as pxt
 import pytest
+from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
 
 from pydantic_ai_pixeltable import Pixeltable
-
-DIM = 8
-
-
-@pxt.udf
-def tiny_embed(text: str) -> pxt.Array[(8,), pxt.Float]:
-    digest = hashlib.sha256(text.encode()).digest()
-    values = np.array([(digest[i % 32] / 127.5) - 1.0 for i in range(DIM)], dtype=np.float32)
-    norm = float(np.linalg.norm(values))
-    return values / norm if norm else values
+from tests.embed import DIM, tiny_embed
 
 
 @pytest.fixture()
@@ -61,9 +53,21 @@ def test_read_only_false_rejected() -> None:
 def test_tables_required_and_star(catalog: str) -> None:
     with pytest.raises(ValueError, match="tables"):
         Pixeltable()
+    with pytest.raises(ValueError, match="only entry"):
+        Pixeltable(tables=["*", f"{catalog}.chunks"])
     names = Pixeltable(tables=["*"]).get_toolset().list_tables()["tables"]
     assert f"{catalog}.chunks" in names
     assert f"{catalog}.other" in names
+
+
+def test_tables_rejects_a_string() -> None:
+    with pytest.raises(ValueError, match="list of paths"):
+        Pixeltable(tables="my_app.doc_chunks")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="list of paths"):
+        Pixeltable.from_spec(tables="my_app.doc_chunks")  # type: ignore[arg-type]
+    spec = {"model": "test", "capabilities": [{"Pixeltable": {"tables": "my_app.doc_chunks"}}]}
+    with pytest.raises(ValueError, match="list of paths"):
+        Agent.from_spec(spec, custom_capability_types=[Pixeltable])
 
 
 def test_from_spec_and_id() -> None:
@@ -126,3 +130,30 @@ def test_similarity_ranks_exact_text(catalog: str) -> None:
     assert result["rows"][0]["text"] == "cats sit on mats"
     assert "score" in result["rows"][0]
     assert result["rows"][0]["score"] >= result["rows"][-1]["score"]
+
+
+def test_named_media_column_returns_file_url(catalog: str, tmp_path: Path) -> None:
+    docs = pxt.create_table(f"{catalog}.docs", {"doc": pxt.Document, "title": pxt.String})
+    note = tmp_path / "note.md"
+    note.write_text("# note\n")
+    docs.insert([{"doc": str(note), "title": "note"}])
+    tools = Pixeltable(tables=[f"{catalog}.docs"]).get_toolset()
+
+    default = tools.query_table(f"{catalog}.docs")
+    assert default["rows"]
+    assert "doc" not in default["rows"][0]
+    assert "title" in default["rows"][0]
+
+    named = tools.query_table(f"{catalog}.docs", columns=["doc", "title"])
+    url = named["rows"][0]["doc"]
+    assert isinstance(url, str)
+    assert url.startswith("file:")
+
+
+def test_agent_from_spec_requires_custom_capability_types() -> None:
+    spec = {"model": "test", "capabilities": [{"Pixeltable": {"tables": ["my_app.doc_chunks"]}}]}
+    with pytest.raises(ValueError, match="custom_capability_types"):
+        Agent.from_spec(spec)
+    agent = Agent.from_spec(spec, custom_capability_types=[Pixeltable])
+    loaded = [cap for cap in agent.root_capability.capabilities if isinstance(cap, Pixeltable)]
+    assert loaded[0].tables == ["my_app.doc_chunks"]

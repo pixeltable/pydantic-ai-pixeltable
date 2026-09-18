@@ -30,6 +30,15 @@ def _reject_reserved_path(path: str) -> None:
         raise ValueError(f"memory path {path!r} is reserved for store bookkeeping")
 
 
+def _insert_rows(t: pxt.Table, rows: list[dict[str, Any]]) -> None:
+    try:
+        t.insert(rows)
+    except pxt.Error as exc:
+        if "Duplicate primary key" in str(exc):
+            raise MemoryConflictError(str(exc)) from exc
+        raise
+
+
 class PixeltableMemoryStore:
     """Pydantic AI Harness ``MemoryStore`` persisted in a Pixeltable table.
 
@@ -139,7 +148,8 @@ class PixeltableMemoryStore:
     def _next_generation(self, t: pxt.Table) -> int:
         rows = t.where(t.path == _META_PATH).select(t.version).collect()
         if len(rows) == 0:
-            t.insert(
+            _insert_rows(
+                t,
                 [
                     {
                         "path": _META_PATH,
@@ -150,7 +160,7 @@ class PixeltableMemoryStore:
                         "fingerprint": None,
                         "existed": None,
                     }
-                ]
+                ],
             )
             return 1
         status = t.update({"version": t.version + 1}, where=t.path == _META_PATH, return_rows=True)
@@ -171,7 +181,8 @@ class PixeltableMemoryStore:
     def _record_operation(self, t: pxt.Table, operation: MemoryOperation | None, mutation: MemoryMutation) -> None:
         if operation is None:
             return
-        t.insert(
+        _insert_rows(
+            t,
             [
                 {
                     "path": f"{_OP_PREFIX}{operation.id}",
@@ -182,7 +193,7 @@ class PixeltableMemoryStore:
                     "fingerprint": operation.fingerprint,
                     "existed": mutation.existed,
                 }
-            ]
+            ],
         )
 
     def _read_sync(self, path: str, max_chars: int) -> MemoryFile | None:
@@ -225,7 +236,8 @@ class PixeltableMemoryStore:
         version = self._next_generation(t)
         op_id = operation.id if operation else None
         if row is None:
-            t.insert(
+            _insert_rows(
+                t,
                 [
                     {
                         "path": path,
@@ -236,7 +248,7 @@ class PixeltableMemoryStore:
                         "fingerprint": None,
                         "existed": None,
                     }
-                ]
+                ],
             )
         else:
             status = t.update(
