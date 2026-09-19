@@ -165,7 +165,7 @@ async def test_table_content_update_leaves_version(store: PixeltableMemoryStore)
 
 
 async def test_duplicate_insert_is_conflict(store: PixeltableMemoryStore) -> None:
-    created = await store.write("race.md", "A", expected_version=None)
+    await store.write("race.md", "A", expected_version=None)
     other = PixeltableMemoryStore(table_name=store._table_name)
     with pytest.raises(MemoryConflictError):
         await other.write("race.md", "B", expected_version=None)
@@ -178,7 +178,7 @@ async def test_duplicate_insert_is_conflict(store: PixeltableMemoryStore) -> Non
                     "path": "race.md",
                     "kind": "file",
                     "content": "C",
-                    "version": int(created.version) + 1 if created.version else 99,
+                    "version": uuid.uuid4().hex,
                     "last_operation_id": None,
                     "fingerprint": None,
                     "existed": None,

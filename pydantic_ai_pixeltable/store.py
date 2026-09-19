@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
@@ -20,10 +21,9 @@ from pydantic_ai_harness.memory import (
 )
 
 _KIND_FILE = "file"
-_KIND_META = "meta"
 _KIND_OP = "op"
-_META_PATH = "__meta__/generation"
 _OP_PREFIX = "__op__/"
+# __op__ receipts are written today; __meta__ stays reserved for future bookkeeping.
 _RESERVED_ROOTS = frozenset({"__meta__", "__op__"})
 
 
@@ -136,6 +136,7 @@ class PixeltableMemoryStore:
     def __init__(self, table_name: str = "harness.memory") -> None:
         self._table_name = table_name
         self._lock = threading.RLock()
+        self._table: pxt.Table | None = None
 
     @property
     def table(self) -> pxt.Table:
@@ -187,7 +188,12 @@ class PixeltableMemoryStore:
 
     def _locked(self, fn: Any, *args: Any) -> Any:
         with self._lock:
-            return fn(*args)
+            try:
+                return fn(*args)
+            except pxt.NotFoundError:
+                # The cached handle goes stale if the table was dropped; recreate and retry once.
+                self._table = None
+                return fn(*args)
 
     def _ensure_dirs(self) -> None:
         if "." not in self._table_name:
@@ -199,22 +205,32 @@ class PixeltableMemoryStore:
             pxt.create_dir(".".join(acc), if_exists="ignore")
 
     def _ensure_table(self) -> pxt.Table:
+        if self._table is not None:
+            return self._table
         try:
-            return pxt.get_table(self._table_name)
+            t = pxt.get_table(self._table_name)
         except pxt.NotFoundError:
-            pass
+            t = None
+        if t is not None:
+            # Earlier releases used an Int version column; versions are UUID strings now.
+            col_type = t.get_metadata()["columns"].get("version", {}).get("type_", "")
+            if not col_type.startswith("String"):
+                raise ValueError(f"{self._table_name!r} uses an Int version column; drop and recreate the table")
+            self._table = t
+            return t
         self._ensure_dirs()
         schema: dict[str, Any] = {
             # Required: older pixeltable makes columns nullable by default and rejects a nullable primary key.
             "path": pxt.Required[pxt.String],
             "kind": pxt.String,
             "content": pxt.String | None,
-            "version": pxt.Int | None,
+            "version": pxt.String | None,
             "last_operation_id": pxt.String | None,
             "fingerprint": pxt.String | None,
             "existed": pxt.Bool | None,
         }
-        return pxt.create_table(self._table_name, schema, primary_key="path", if_exists="ignore")
+        self._table = pxt.create_table(self._table_name, schema, primary_key="path", if_exists="ignore")
+        return self._table
 
     def _file_row(self, t: pxt.Table, path: str) -> dict[str, Any] | None:
         rows = (
@@ -225,29 +241,6 @@ class PixeltableMemoryStore:
         if len(rows) == 0:
             return None
         return rows[0]
-
-    def _next_generation(self, t: pxt.Table) -> int:
-        rows = t.where(t.path == _META_PATH).select(t.version).collect()
-        if len(rows) == 0:
-            _insert_rows(
-                t,
-                [
-                    {
-                        "path": _META_PATH,
-                        "kind": _KIND_META,
-                        "content": None,
-                        "version": 1,
-                        "last_operation_id": None,
-                        "fingerprint": None,
-                        "existed": None,
-                    }
-                ],
-            )
-            return 1
-        status = t.update({"version": t.version + 1}, where=t.path == _META_PATH, return_rows=True)
-        if not status.rows:
-            raise RuntimeError("failed to increment memory generation")
-        return int(status.rows[0]["version"])
 
     def _lookup_operation(self, t: pxt.Table, operation: MemoryOperation) -> MemoryMutation | None:
         rows = t.where(t.path == f"{_OP_PREFIX}{operation.id}").select(t.fingerprint, t.version, t.existed).collect()
@@ -269,7 +262,7 @@ class PixeltableMemoryStore:
                     "path": f"{_OP_PREFIX}{operation.id}",
                     "kind": _KIND_OP,
                     "content": None,
-                    "version": int(mutation.version) if mutation.version is not None else None,
+                    "version": mutation.version,
                     "last_operation_id": None,
                     "fingerprint": operation.fingerprint,
                     "existed": mutation.existed,
@@ -314,7 +307,7 @@ class PixeltableMemoryStore:
         current = None if row is None else str(row["version"])
         if current != expected_version:
             raise MemoryConflictError(f"memory path {path!r} changed before it could be written")
-        version = self._next_generation(t)
+        version = uuid.uuid4().hex
         op_id = operation.id if operation else None
         if row is None:
             _insert_rows(
@@ -334,11 +327,11 @@ class PixeltableMemoryStore:
         else:
             status = t.update(
                 {"content": content, "version": version, "last_operation_id": op_id},
-                where=(t.path == path) & (t.kind == _KIND_FILE) & (t.version == int(current)),
+                where=(t.path == path) & (t.kind == _KIND_FILE) & (t.version == current),
             )
             if status.row_count_stats.upd_rows != 1:
                 raise MemoryConflictError(f"memory path {path!r} changed before it could be written")
-        mutation = MemoryMutation(version=str(version), replayed=False, existed=row is not None)
+        mutation = MemoryMutation(version=version, replayed=False, existed=row is not None)
         self._record_operation(t, operation, mutation)
         return mutation
 
@@ -359,9 +352,8 @@ class PixeltableMemoryStore:
         current = None if row is None else str(row["version"])
         if current != expected_version:
             raise MemoryConflictError(f"memory path {path!r} changed before it could be deleted")
-        self._next_generation(t)
         if row is not None:
-            status = t.delete(where=(t.path == path) & (t.kind == _KIND_FILE) & (t.version == int(current)))
+            status = t.delete(where=(t.path == path) & (t.kind == _KIND_FILE) & (t.version == current))
             if status.row_count_stats.del_rows != 1:
                 raise MemoryConflictError(f"memory path {path!r} changed before it could be deleted")
         mutation = MemoryMutation(version=None, replayed=False, existed=row is not None)

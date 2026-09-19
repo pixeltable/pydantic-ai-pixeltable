@@ -83,6 +83,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
     def __init__(self, *, tables: list[str] | None, max_rows: int, max_chars: int) -> None:
         super().__init__()
         self._tables = tables
+        self._handles: dict[str, pxt.Table] = {}
         self._max_rows = max_rows
         self._max_chars = max_chars
         self.add_function(self.list_tables, name="list_tables")
@@ -108,7 +109,11 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             Kind, comment, columns, and indexes.
         """
         t = self._open_table(table)
-        metadata = t.get_metadata()
+        try:
+            metadata = t.get_metadata()
+        except pxt.Error as exc:
+            self._handles.pop(table, None)
+            raise ModelRetry(str(exc)) from exc
         # pixeltable renamed the metadata key "indices" to "indexes" in 0.7.x.
         indexes = metadata.get("indexes") or metadata.get("indices") or {}
         return {
@@ -145,8 +150,13 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             Matching rows, with ``truncated`` set when the row or character cap applied.
         """
         t = self._open_table(table)
-        query = self._project(t, columns)
-        query = self._where(query, t, where)
+        try:
+            metadata = t.get_metadata()
+        except pxt.Error as exc:
+            self._handles.pop(table, None)
+            raise ModelRetry(str(exc)) from exc
+        query = self._project(t, columns, metadata)
+        query = self._where(query, t, where, metadata)
         return self._collect(table, query, limit)
 
     def similarity_search(
@@ -174,45 +184,54 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         if not query.strip():
             raise ModelRetry("similarity_search query must be non-empty")
         t = self._open_table(table)
-        metadata = t.get_metadata()
+        try:
+            metadata = t.get_metadata()
+        except pxt.Error as exc:
+            self._handles.pop(table, None)
+            raise ModelRetry(str(exc)) from exc
         column_md = metadata["columns"]
         if column not in column_md:
             raise ModelRetry(f"Unknown column {column!r} on {_norm(metadata['path'])!r}. Call describe_table.")
-        selected = self._default_columns(t) if columns is None else list(columns)
+        selected = self._default_columns(metadata) if columns is None else list(columns)
         if column not in selected and not _is_skipped_type(column_md[column]["type_"]):
             selected = [column, *[name for name in selected if name != column]]
         try:
             search = (
                 t[column].similarity(string=query, idx=idx) if idx is not None else t[column].similarity(string=query)
             )
-            query_obj = self._project(t, selected, score=search).order_by(search, asc=False)
+            query_obj = self._project(t, selected, metadata, score=search).order_by(search, asc=False)
             return self._collect(table, query_obj, limit)
         except pxt.Error as exc:
+            self._handles.pop(table, None)
             raise ModelRetry(str(exc)) from exc
 
     def _open_table(self, table: str) -> pxt.Table:
         if not _allowed(table, self._tables):
             raise ModelRetry(f"Table {table!r} is not in the Pixeltable allowlist. Call list_tables.")
+        cached = self._handles.get(table)
+        if cached is not None:
+            return cached
         try:
-            return pxt.get_table(table)
+            t = pxt.get_table(table)
         except pxt.Error as exc:
             raise ModelRetry(f"Cannot open table {table!r}: {exc}") from exc
+        self._handles[table] = t
+        return t
 
-    def _default_columns(self, t: pxt.Table) -> list[str]:
+    def _default_columns(self, metadata: dict[str, Any]) -> list[str]:
         columns: list[str] = []
-        for name, info in t.get_metadata()["columns"].items():
+        for name, info in metadata["columns"].items():
             type_ = info["type_"]
             if _is_media_type(type_) or _is_skipped_type(type_):
                 continue
             columns.append(name)
         return columns
 
-    def _project(self, t: pxt.Table, columns: list[str] | None, **extra: Any) -> Any:
-        metadata = t.get_metadata()
+    def _project(self, t: pxt.Table, columns: list[str] | None, metadata: dict[str, Any], **extra: Any) -> Any:
         path = _norm(metadata["path"])
         column_md = metadata["columns"]
         if columns is None:
-            names = self._default_columns(t)
+            names = self._default_columns(metadata)
         else:
             names = list(columns)
             if not names:
@@ -236,10 +255,10 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             raise ModelRetry("No selectable columns. Name a non-array column, or describe_table.")
         return t.select(*items, **named)
 
-    def _where(self, query: Any, t: pxt.Table, where: dict[str, Any] | None) -> Any:
+    def _where(self, query: Any, t: pxt.Table, where: dict[str, Any] | None, metadata: dict[str, Any]) -> Any:
         if not where:
             return query
-        column_md = t.get_metadata()["columns"]
+        column_md = metadata["columns"]
         pred = None
         for name, value in where.items():
             if name not in column_md:
@@ -255,6 +274,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         try:
             fetched = list(query.limit(n + 1).collect())
         except pxt.Error as exc:
+            self._handles.pop(table, None)
             raise ModelRetry(str(exc)) from exc
         has_more = len(fetched) > n
         rows = [_row(dict(row)) for row in fetched[:n]]

@@ -33,7 +33,7 @@ def root():
         pass
 
 
-def _file_row(path: str, content: str, version: int) -> dict[str, object]:
+def _file_row(path: str, content: str, version: str) -> dict[str, object]:
     return {
         "path": path,
         "kind": "file",
@@ -48,8 +48,8 @@ def _file_row(path: str, content: str, version: int) -> dict[str, object]:
 async def test_memory_prefix_list_search_and_cas(root: str) -> None:
     store = PixeltableMemoryStore(table_name=f"{root}.memory")
     t = store.table
-    rows = [_file_row(f"tenant-a/n{i}.md", "alpha note", i + 1) for i in range(N_A)]
-    rows.extend(_file_row(f"tenant-b/n{i}.md", "beta private", N_A + i + 1) for i in range(N_B))
+    rows = [_file_row(f"tenant-a/n{i}.md", "alpha note", uuid.uuid4().hex) for i in range(N_A)]
+    rows.extend(_file_row(f"tenant-b/n{i}.md", "beta private", uuid.uuid4().hex) for i in range(N_B))
     started = time.perf_counter()
     for offset in range(0, len(rows), 5_000):
         t.insert(rows[offset : offset + 5_000])
