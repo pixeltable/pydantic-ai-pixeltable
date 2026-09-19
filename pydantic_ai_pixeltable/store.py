@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
+from collections.abc import Iterable
 from typing import Any
 
 import pixeltable as pxt
@@ -13,9 +15,9 @@ from pydantic_ai_harness.memory import (
     MemoryMutation,
     MemoryOperation,
     MemoryOperationConflictError,
+    MemorySearchMatch,
     MemorySearchResult,
 )
-from pydantic_ai_harness.memory._store import lexical_search, validate_store_path, validate_store_prefix
 
 _KIND_FILE = "file"
 _KIND_META = "meta"
@@ -28,6 +30,84 @@ _RESERVED_ROOTS = frozenset({"__meta__", "__op__"})
 def _reject_reserved_path(path: str) -> None:
     if path.split("/", 1)[0] in _RESERVED_ROOTS:
         raise ValueError(f"memory path {path!r} is reserved for store bookkeeping")
+
+
+# Path validation and lexical search mirror pydantic_ai_harness.memory._store. Vendored so this
+# package does not depend on a private harness module; keep behavior identical to the originals.
+
+_VALID_SEGMENT_RE = re.compile(r"[A-Za-z0-9_.-]{1,200}")
+
+
+def _validate_store_path(path: str) -> None:
+    r"""Reject path strings that could escape a store's root directory."""
+    if not all(_VALID_SEGMENT_RE.fullmatch(segment) and ".." not in segment for segment in path.split("/")):
+        raise ValueError(f"invalid memory path: {path!r}")
+
+
+def _validate_store_prefix(prefix: str) -> None:
+    if prefix:
+        _validate_store_path(prefix.removesuffix("/"))
+
+
+def _snippet(content: str, query: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    lower = content.lower()
+    positions = [lower.find(term) for term in query.lower().split()]
+    found = [position for position in positions if position >= 0]
+    center = min(found) if found else 0
+    start = max(0, center - max_chars // 3)
+    end = min(len(content), start + max_chars)
+    start = max(0, end - max_chars)
+    snippet = content[start:end]
+    if start:
+        snippet = f"...{snippet[3:]}" if len(snippet) >= 3 else "." * len(snippet)
+    if end < len(content):
+        snippet = f"{snippet[:-3]}..." if len(snippet) >= 3 else "." * len(snippet)
+    return snippet
+
+
+def _lexical_search(
+    files: Iterable[tuple[str, str]],
+    query: str,
+    *,
+    limit: int,
+    max_files: int,
+    max_chars: int,
+    score_prefix: str = "",
+) -> MemorySearchResult:
+    """Search a sorted file stream with deterministic scan and output bounds."""
+    terms = [term for term in query.lower().split() if term]
+    if not terms or limit <= 0 or max_files <= 0 or max_chars <= 0:
+        return MemorySearchResult(matches=[], scanned=0, truncated=False)
+    scored: list[tuple[float, str, str]] = []
+    scanned = 0
+    truncated = False
+    for path, content in files:
+        if scanned >= max_files:
+            truncated = True
+            break
+        scanned += 1
+        lower_path = path.removeprefix(score_prefix).lower()
+        lower_content = content.lower()
+        score = float(sum(lower_content.count(term) + 2 * lower_path.count(term) for term in terms))
+        if score:
+            scored.append((score, path, content))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    matches: list[MemorySearchMatch] = []
+    remaining = max_chars
+    for score, path, content in scored[:limit]:
+        visible_path = path.removeprefix(score_prefix)
+        available = remaining - len(visible_path)
+        if available <= 0:
+            truncated = True
+            break
+        snippet = _snippet(content, query, available)
+        matches.append(MemorySearchMatch(path=path, snippet=snippet, score=score))
+        remaining -= len(visible_path) + len(snippet)
+    if len(scored) > len(matches):
+        truncated = True
+    return MemorySearchResult(matches=matches, scanned=scanned, truncated=truncated)
 
 
 def _insert_rows(t: pxt.Table, rows: list[dict[str, Any]]) -> None:
@@ -121,7 +201,7 @@ class PixeltableMemoryStore:
     def _ensure_table(self) -> pxt.Table:
         try:
             return pxt.get_table(self._table_name)
-        except Exception:
+        except pxt.NotFoundError:
             pass
         self._ensure_dirs()
         schema: dict[str, Any] = {
@@ -198,7 +278,7 @@ class PixeltableMemoryStore:
         )
 
     def _read_sync(self, path: str, max_chars: int) -> MemoryFile | None:
-        validate_store_path(path)
+        _validate_store_path(path)
         _reject_reserved_path(path)
         if max_chars <= 0:
             raise ValueError("max_chars must be positive")
@@ -223,7 +303,7 @@ class PixeltableMemoryStore:
         expected_version: str | None,
         operation: MemoryOperation | None,
     ) -> MemoryMutation:
-        validate_store_path(path)
+        _validate_store_path(path)
         _reject_reserved_path(path)
         t = self._ensure_table()
         if operation is not None:
@@ -268,7 +348,7 @@ class PixeltableMemoryStore:
         expected_version: str | None,
         operation: MemoryOperation | None,
     ) -> MemoryMutation:
-        validate_store_path(path)
+        _validate_store_path(path)
         _reject_reserved_path(path)
         t = self._ensure_table()
         if operation is not None:
@@ -296,7 +376,7 @@ class PixeltableMemoryStore:
         return t.where(pred)
 
     def _list_paths_sync(self, prefix: str, limit: int) -> list[str]:
-        validate_store_prefix(prefix)
+        _validate_store_prefix(prefix)
         if limit <= 0:
             raise ValueError("limit must be positive")
         t = self._ensure_table()
@@ -312,7 +392,7 @@ class PixeltableMemoryStore:
         max_chars: int,
         max_file_chars: int,
     ) -> MemorySearchResult:
-        validate_store_prefix(prefix)
+        _validate_store_prefix(prefix)
         if not query.split() or limit <= 0 or max_files <= 0 or max_chars <= 0 or max_file_chars <= 0:
             return MemorySearchResult(matches=[], scanned=0, truncated=False)
         t = self._ensure_table()
@@ -323,7 +403,7 @@ class PixeltableMemoryStore:
         scanned_rows = fetched[:max_files]
         files = [(str(row["path"]), (row["content"] or "")[:max_file_chars]) for row in scanned_rows]
         content_truncated = any(len(row["content"] or "") > max_file_chars for row in scanned_rows)
-        result = lexical_search(
+        result = _lexical_search(
             files, query, limit=limit, max_files=max_files, max_chars=max_chars, score_prefix=prefix
         )
         return MemorySearchResult(
