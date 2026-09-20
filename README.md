@@ -57,7 +57,7 @@ Two `Pixeltable(...)` instances share `id="pixeltable"` and merge. [`pydantic-ai
 
 - `query_table` filters with equality only (`{"status": "open"}`).
 - `similarity_search` calls `column.similarity(string=query)` and needs an embedding index on that column.
-- Output is bounded by `max_rows` and `max_chars`. Default columns skip media, array, and binary; a named media column returns a file URL, not a blob.
+- Output is bounded by `max_rows` and `max_chars`; the minimal `{"table", "rows", "truncated"}` envelope is always returned, even when `max_chars` is set below its size. Default columns skip media, array, and binary; a named media column returns a file URL, not a blob.
 - `read_only=False` is not implemented.
 
 Declare the tables and index on a `TableModel` in `app.py`; `pxt schema update` creates them:

@@ -121,6 +121,11 @@ def test_query_row_and_char_bounds(catalog: str) -> None:
     assert tiny["truncated"]
     assert len(json.dumps(tiny, ensure_ascii=False)) <= 100
 
+    # A cap below the minimal envelope size cannot shrink the payload further.
+    micro = _tools(catalog, max_chars=1).query_table(f"{catalog}.chunks", columns=["text"])
+    assert micro["rows"] == []
+    assert micro["truncated"]
+
 
 def test_similarity_ranks_exact_text(catalog: str) -> None:
     t = pxt.get_table(f"{catalog}.chunks")
@@ -221,6 +226,12 @@ def test_tool_error_branches(catalog: str) -> None:
         tools.query_table(f"{catalog}.chunks", columns=[])
     with pytest.raises(ModelRetry, match="at least 1"):
         tools.query_table(f"{catalog}.chunks", limit=0)
+    with pytest.raises(ModelRetry, match="scalar"):
+        tools.query_table(f"{catalog}.chunks", where={"status": ["open", "closed"]})
+    with pytest.raises(ModelRetry, match="scalar"):
+        tools.query_table(f"{catalog}.chunks", where={"status": {"nested": 1}})
+    with pytest.raises(ModelRetry, match="equality filters"):
+        tools.query_table(f"{catalog}.chunks", where={"vec": 5})
 
     prefix_tools = Pixeltable(tables=[catalog]).get_toolset()
     with pytest.raises(ModelRetry, match="Cannot open"):

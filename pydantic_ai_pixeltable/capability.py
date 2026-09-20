@@ -48,7 +48,9 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
     """Hard cap on rows returned by ``query_table`` and ``similarity_search``."""
 
     max_chars: int = 8000
-    """Hard cap on serialized JSON characters for those two tools."""
+    """Cap on serialized JSON characters for those two tools. The minimal
+    ``{"table", "rows", "truncated"}`` envelope is always returned, even when a
+    cap below its size is configured."""
 
     guidance: str | None = None
     """System-prompt text. ``None`` uses the default; ``''`` adds none."""

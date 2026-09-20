@@ -241,17 +241,56 @@ async def test_argument_validation(store: PixeltableMemoryStore) -> None:
         await store.search("bad prefix/", "q", limit=1, max_files=1, max_chars=1, max_file_chars=1)
 
 
-def test_int_version_table_rejected() -> None:
+def test_incompatible_existing_table_rejected() -> None:
     name = f"test_pydantic_ai.legacy_{uuid.uuid4().hex[:8]}"
     pxt.create_dir("test_pydantic_ai", if_exists="ignore")
+    memory_columns = {
+        "path": pxt.String,
+        "kind": pxt.String,
+        "content": pxt.String | None,
+        "version": pxt.String | None,
+        "last_operation_id": pxt.String | None,
+        "fingerprint": pxt.String | None,
+        "existed": pxt.Bool | None,
+    }
     try:
+        # Pre-release revisions used an Int version column.
         pxt.create_table(
             name,
             {"path": pxt.Required[pxt.String], "version": pxt.Int | None},
             primary_key="path",
         )
-        with pytest.raises(ValueError, match="Int version"):
+        with pytest.raises(ValueError, match="not a memory table"):
             _ = PixeltableMemoryStore(table_name=name).table
+        pxt.drop_table(name, force=True)
+
+        # Correct column types but no primary key: compare-and-set would append duplicates.
+        pxt.create_table(name, memory_columns)
+        with pytest.raises(ValueError, match="not a memory table"):
+            _ = PixeltableMemoryStore(table_name=name).table
+        pxt.drop_table(name, force=True)
+
+        # Missing bookkeeping columns.
+        pxt.create_table(
+            name,
+            {"path": pxt.Required[pxt.String], "kind": pxt.String},
+            primary_key="path",
+        )
+        with pytest.raises(ValueError, match="column 'content' is missing"):
+            _ = PixeltableMemoryStore(table_name=name).table
+    finally:
+        pxt.drop_table(name, force=True)
+
+
+def test_existing_memory_table_is_reused() -> None:
+    name = f"test_pydantic_ai.reuse_{uuid.uuid4().hex[:8]}"
+    pxt.create_dir("test_pydantic_ai", if_exists="ignore")
+    try:
+        first = PixeltableMemoryStore(table_name=name)
+        assert first.table is not None
+        # A second instance must accept the schema the first one created.
+        second = PixeltableMemoryStore(table_name=name)
+        assert second.table is not None
     finally:
         pxt.drop_table(name, force=True)
 

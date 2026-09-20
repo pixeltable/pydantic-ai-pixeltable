@@ -120,6 +120,27 @@ def _insert_rows(t: pxt.Table, rows: list[dict[str, Any]]) -> None:
         raise
 
 
+# Expected type base per column for a memory table; compare-and-set needs all of
+# them plus the primary key on `path`.
+_SCHEMA_COLUMNS = {
+    "path": "String",
+    "kind": "String",
+    "content": "String",
+    "version": "String",
+    "last_operation_id": "String",
+    "fingerprint": "String",
+    "existed": "Bool",
+}
+
+
+def _column_base(type_: Any) -> str:
+    base = str(type_).split(" | ", 1)[0]
+    # 0.6.x renders non-nullable columns as 'Required[T]'; 0.7.x renders them as 'T'.
+    if base.startswith("Required[") and base.endswith("]"):
+        base = base[len("Required[") : -1]
+    return base.split("[", 1)[0]
+
+
 class PixeltableMemoryStore:
     """Pydantic AI Harness ``MemoryStore`` persisted in a Pixeltable table.
 
@@ -215,10 +236,7 @@ class PixeltableMemoryStore:
         except pxt.NotFoundError:
             t = None
         if t is not None:
-            # Earlier releases used an Int version column; versions are UUID strings now.
-            col_type = t.get_metadata()["columns"].get("version", {}).get("type_", "")
-            if not col_type.startswith("String"):
-                raise ValueError(f"{self._table_name!r} uses an Int version column; drop and recreate the table")
+            self._check_compatible_schema(t)
             self._table = t
             return t
         self._ensure_dirs()
@@ -234,6 +252,28 @@ class PixeltableMemoryStore:
         }
         self._table = pxt.create_table(self._table_name, schema, primary_key="path", if_exists="ignore")
         return self._table
+
+    def _check_compatible_schema(self, t: pxt.Table) -> None:
+        """Reject a pre-existing table whose schema cannot back the MemoryStore protocol."""
+        metadata = t.get_metadata()
+        columns = metadata.get("columns") or {}
+        problems: list[str] = []
+        for name, expected in _SCHEMA_COLUMNS.items():
+            info = columns.get(name)
+            if info is None:
+                problems.append(f"column {name!r} is missing")
+            elif _column_base(info.get("type_")) != expected:
+                problems.append(f"column {name!r} has type {info.get('type_')!r}, expected {expected!r}")
+        primary_key = metadata.get("primary_key")
+        if primary_key is not None:
+            if list(primary_key) != ["path"]:
+                problems.append(f"primary key is {list(primary_key)!r}, expected ['path']")
+        elif (columns.get("path") or {}).get("is_primary_key") is False:
+            problems.append("column 'path' has no primary key constraint")
+        if problems:
+            raise ValueError(
+                f"{self._table_name!r} is not a memory table ({'; '.join(problems)}); drop and recreate it"
+            )
 
     def _file_row(self, t: pxt.Table, path: str) -> dict[str, Any] | None:
         rows = (

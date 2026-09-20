@@ -265,9 +265,19 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         for name, value in where.items():
             if name not in column_md:
                 raise ModelRetry(f"Unknown column {name!r} in where. Call describe_table.")
-            clause = t[name] == value
-            pred = clause if pred is None else pred & clause
-        return query.where(pred)
+            if _is_skipped_type(column_md[name]["type_"]):
+                raise ModelRetry(f"Column {name!r} does not support equality filters. Call describe_table.")
+            if value is not None and not isinstance(value, (str, int, float, bool)):
+                raise ModelRetry(f"where value for {name!r} must be a scalar, got {type(value).__name__}")
+            try:
+                clause = t[name] == value
+                pred = clause if pred is None else pred & clause
+            except (pxt.Error, TypeError, ValueError) as exc:
+                raise ModelRetry(f"Cannot filter {name!r} by {value!r}: {exc}") from exc
+        try:
+            return query.where(pred)
+        except (pxt.Error, TypeError, ValueError) as exc:
+            raise ModelRetry(str(exc)) from exc
 
     def _collect(self, table: str, query: Any, limit: int) -> dict[str, Any]:
         if limit < 1:
