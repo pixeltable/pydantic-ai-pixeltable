@@ -20,6 +20,8 @@ from pydantic_ai_harness.memory import (
     MemorySearchResult,
 )
 
+from pydantic_ai_pixeltable._types import column_base, is_nullable_type
+
 _KIND_FILE = "file"
 _KIND_OP = "op"
 _OP_PREFIX = "__op__/"
@@ -136,24 +138,6 @@ _SCHEMA_COLUMNS = {
 _NULLABLE_COLUMNS = frozenset({"content", "version", "last_operation_id", "fingerprint", "existed"})
 
 
-def _column_base(type_: Any) -> str:
-    base = str(type_).split(" | ", 1)[0]
-    # 0.6.x renders non-nullable columns as 'Required[T]'; 0.7.x renders them as 'T'.
-    if base.startswith("Required[") and base.endswith("]"):
-        base = base[len("Required[") : -1]
-    return base.split("[", 1)[0]
-
-
-def _is_nullable_type(type_: Any, legacy_schema: bool) -> bool:
-    rendered = str(type_)
-    if rendered.startswith("Required["):
-        return False
-    if " | None" in rendered:
-        return True
-    # A bare 'T' is nullable under 0.6.x's schema-style rendering, non-nullable under 0.7.x's repr.
-    return legacy_schema
-
-
 class PixeltableMemoryStore:
     """Pydantic AI Harness ``MemoryStore`` persisted in a Pixeltable table.
 
@@ -263,8 +247,11 @@ class PixeltableMemoryStore:
             "fingerprint": pxt.String | None,
             "existed": pxt.Bool | None,
         }
-        self._table = pxt.create_table(self._table_name, schema, primary_key="path", if_exists="ignore")
-        return self._table
+        t = pxt.create_table(self._table_name, schema, primary_key="path", if_exists="ignore")
+        # if_exists='ignore' can also return a table a concurrent writer just created; check it too.
+        self._check_compatible_schema(t)
+        self._table = t
+        return t
 
     def _check_compatible_schema(self, t: pxt.Table) -> None:
         """Reject a pre-existing table whose schema cannot back the MemoryStore protocol."""
@@ -282,16 +269,19 @@ class PixeltableMemoryStore:
             if info is None:
                 problems.append(f"column {name!r} is missing")
                 continue
+            if info.get("is_computed"):
+                problems.append(f"column {name!r} is computed; the store writes it directly")
+                continue
             type_ = str(info.get("type_"))
-            if _column_base(type_) != expected:
+            if column_base(type_) != expected:
                 problems.append(f"column {name!r} has type {type_!r}, expected {expected!r}")
-            elif name in _NULLABLE_COLUMNS and not _is_nullable_type(type_, legacy_schema):
+            elif name in _NULLABLE_COLUMNS and not is_nullable_type(type_, legacy_schema):
                 problems.append(f"column {name!r} is not nullable; the store writes None to it")
         for name, info in columns.items():
             if (
                 name not in _SCHEMA_COLUMNS
                 and not info.get("is_computed")
-                and not _is_nullable_type(info.get("type_"), legacy_schema)
+                and not is_nullable_type(info.get("type_"), legacy_schema)
             ):
                 problems.append(f"column {name!r} is not nullable, and inserts never set it")
         primary_key = metadata.get("primary_key")

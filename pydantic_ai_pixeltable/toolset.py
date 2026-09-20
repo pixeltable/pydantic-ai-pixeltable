@@ -10,6 +10,8 @@ from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
 
+from pydantic_ai_pixeltable._types import column_base
+
 _MEDIA = frozenset({"Image", "Video", "Audio", "Document"})
 ALL_TABLES = "*"
 
@@ -25,16 +27,12 @@ def _allowed(path: str, tables: list[str] | None) -> bool:
     return any(npath == _norm(entry) or npath.startswith(f"{_norm(entry)}.") for entry in tables)
 
 
-def _type_base(type_: str) -> str:
-    return type_.split(" | ", 1)[0].split("[", 1)[0]
-
-
 def _is_media_type(type_: str) -> bool:
-    return _type_base(type_) in _MEDIA
+    return column_base(type_) in _MEDIA
 
 
 def _is_skipped_type(type_: str) -> bool:
-    return _type_base(type_) in {"Array", "Binary"}
+    return column_base(type_) in {"Array", "Binary"}
 
 
 def _cell(value: Any) -> Any:

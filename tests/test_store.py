@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 import pixeltable as pxt
 import pytest
@@ -301,6 +302,17 @@ def test_incompatible_existing_table_rejected() -> None:
             _ = PixeltableMemoryStore(table_name=name).table
         pxt.drop_table(name, force=True)
 
+        # Inserts write `content`, so a computed column there rejects them.
+        t = pxt.create_table(
+            name,
+            {k: v for k, v in pk_columns.items() if k != "content"},
+            primary_key="path",
+        )
+        t.add_computed_column(content=t.version)
+        with pytest.raises(ValueError, match="computed"):
+            _ = PixeltableMemoryStore(table_name=name).table
+        pxt.drop_table(name, force=True)
+
         # A view reports the same columns and primary key but rejects writes.
         pxt.create_table(name, pk_columns, primary_key="path")
         view = f"{name}_view"
@@ -346,6 +358,40 @@ def test_existing_memory_table_is_reused() -> None:
         assert PixeltableMemoryStore(table_name=name).table is not None
     finally:
         pxt.drop_table(name, force=True)
+
+
+def test_create_path_still_validates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """if_exists='ignore' can return a concurrently created table; it must be checked too."""
+    name = f"test_pydantic_ai.race_{uuid.uuid4().hex[:8]}"
+    pxt.create_dir("test_pydantic_ai", if_exists="ignore")
+    pxt.create_table(name, {"a": pxt.Int})
+    real_get_table = pxt.get_table
+
+    def miss(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if path == name:
+            # The table did not exist yet at this simulated point in the race.
+            real_get_table(f"{name}_missing")
+        return real_get_table(path, *args, **kwargs)
+
+    monkeypatch.setattr(pxt, "get_table", miss)
+    try:
+        with pytest.raises(ValueError, match="not a memory table"):
+            _ = PixeltableMemoryStore(table_name=name).table
+    finally:
+        pxt.drop_table(name, force=True)
+
+
+def test_column_base_covers_both_type_renderings() -> None:
+    from pydantic_ai_pixeltable._types import column_base
+
+    # 0.7.x repr style: 'T' non-nullable, 'T | None' nullable.
+    assert column_base("String") == "String"
+    assert column_base("String | None") == "String"
+    assert column_base("Array[(8,), float32] | None") == "Array"
+    # 0.6.x schema style: 'Required[T]' non-nullable, 'T' nullable.
+    assert column_base("Required[String]") == "String"
+    assert column_base("Required[Array[(8,), float32]]") == "Array"
+    assert column_base("Bool") == "Bool"
 
 
 def test_vendored_helpers_match_harness() -> None:
