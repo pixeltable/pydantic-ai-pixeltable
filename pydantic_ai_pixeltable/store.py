@@ -132,6 +132,9 @@ _SCHEMA_COLUMNS = {
     "existed": "Bool",
 }
 
+# File rows and `__op__` receipts each write None to some of these, so they must be nullable.
+_NULLABLE_COLUMNS = frozenset({"content", "version", "last_operation_id", "fingerprint", "existed"})
+
 
 def _column_base(type_: Any) -> str:
     base = str(type_).split(" | ", 1)[0]
@@ -139,6 +142,16 @@ def _column_base(type_: Any) -> str:
     if base.startswith("Required[") and base.endswith("]"):
         base = base[len("Required[") : -1]
     return base.split("[", 1)[0]
+
+
+def _is_nullable_type(type_: Any, legacy_schema: bool) -> bool:
+    rendered = str(type_)
+    if rendered.startswith("Required["):
+        return False
+    if " | None" in rendered:
+        return True
+    # A bare 'T' is nullable under 0.6.x's schema-style rendering, non-nullable under 0.7.x's repr.
+    return legacy_schema
 
 
 class PixeltableMemoryStore:
@@ -256,14 +269,31 @@ class PixeltableMemoryStore:
     def _check_compatible_schema(self, t: pxt.Table) -> None:
         """Reject a pre-existing table whose schema cannot back the MemoryStore protocol."""
         metadata = t.get_metadata()
+        kind = metadata.get("kind", "table")
+        if kind != "table":
+            raise ValueError(f"{self._table_name!r} is a {kind}; the memory store needs a writable table")
         columns = metadata.get("columns") or {}
+        # 'Required[' appears only in 0.6.x's schema-style type_ rendering; seeing it means a
+        # bare 'T' marks a nullable column rather than a non-nullable one.
+        legacy_schema = any(str(info.get("type_")).startswith("Required[") for info in columns.values())
         problems: list[str] = []
         for name, expected in _SCHEMA_COLUMNS.items():
             info = columns.get(name)
             if info is None:
                 problems.append(f"column {name!r} is missing")
-            elif _column_base(info.get("type_")) != expected:
-                problems.append(f"column {name!r} has type {info.get('type_')!r}, expected {expected!r}")
+                continue
+            type_ = str(info.get("type_"))
+            if _column_base(type_) != expected:
+                problems.append(f"column {name!r} has type {type_!r}, expected {expected!r}")
+            elif name in _NULLABLE_COLUMNS and not _is_nullable_type(type_, legacy_schema):
+                problems.append(f"column {name!r} is not nullable; the store writes None to it")
+        for name, info in columns.items():
+            if (
+                name not in _SCHEMA_COLUMNS
+                and not info.get("is_computed")
+                and not _is_nullable_type(info.get("type_"), legacy_schema)
+            ):
+                problems.append(f"column {name!r} is not nullable, and inserts never set it")
         primary_key = metadata.get("primary_key")
         if primary_key is not None:
             if list(primary_key) != ["path"]:

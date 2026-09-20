@@ -253,6 +253,7 @@ def test_incompatible_existing_table_rejected() -> None:
         "fingerprint": pxt.String | None,
         "existed": pxt.Bool | None,
     }
+    pk_columns = {**memory_columns, "path": pxt.Required[pxt.String]}
     try:
         # Pre-release revisions used an Int version column.
         pxt.create_table(
@@ -278,8 +279,39 @@ def test_incompatible_existing_table_rejected() -> None:
         )
         with pytest.raises(ValueError, match="column 'content' is missing"):
             _ = PixeltableMemoryStore(table_name=name).table
-    finally:
         pxt.drop_table(name, force=True)
+
+        # `__op__` receipts write None to `content`, so a non-nullable column rejects them.
+        pxt.create_table(
+            name,
+            {**pk_columns, "content": pxt.Required[pxt.String]},
+            primary_key="path",
+        )
+        with pytest.raises(ValueError, match="not nullable"):
+            _ = PixeltableMemoryStore(table_name=name).table
+        pxt.drop_table(name, force=True)
+
+        # Inserts never set an extra column, so a non-nullable one rejects them.
+        pxt.create_table(
+            name,
+            {**pk_columns, "extra": pxt.Required[pxt.String]},
+            primary_key="path",
+        )
+        with pytest.raises(ValueError, match="inserts never set"):
+            _ = PixeltableMemoryStore(table_name=name).table
+        pxt.drop_table(name, force=True)
+
+        # A view reports the same columns and primary key but rejects writes.
+        pxt.create_table(name, pk_columns, primary_key="path")
+        view = f"{name}_view"
+        try:
+            pxt.create_view(view, pxt.get_table(name))
+            with pytest.raises(ValueError, match="writable table"):
+                _ = PixeltableMemoryStore(table_name=view).table
+        finally:
+            pxt.drop_table(view, force=True, if_not_exists="ignore")
+    finally:
+        pxt.drop_table(name, force=True, if_not_exists="ignore")
 
 
 def test_existing_memory_table_is_reused() -> None:
@@ -291,6 +323,27 @@ def test_existing_memory_table_is_reused() -> None:
         # A second instance must accept the schema the first one created.
         second = PixeltableMemoryStore(table_name=name)
         assert second.table is not None
+    finally:
+        pxt.drop_table(name, force=True)
+
+    # A hand-built table with the same schema is also accepted, extra nullable columns included.
+    name = f"test_pydantic_ai.manual_{uuid.uuid4().hex[:8]}"
+    try:
+        pxt.create_table(
+            name,
+            {
+                "path": pxt.Required[pxt.String],
+                "kind": pxt.String,
+                "content": pxt.String | None,
+                "version": pxt.String | None,
+                "last_operation_id": pxt.String | None,
+                "fingerprint": pxt.String | None,
+                "existed": pxt.Bool | None,
+                "note": pxt.String | None,
+            },
+            primary_key="path",
+        )
+        assert PixeltableMemoryStore(table_name=name).table is not None
     finally:
         pxt.drop_table(name, force=True)
 
