@@ -12,7 +12,7 @@ from pydantic_ai.tools import AgentDepsT
 from pydantic_ai_pixeltable.toolset import ALL_TABLES, PixeltableToolset
 
 if TYPE_CHECKING:
-    from pydantic_ai._instructions import AgentInstructions
+    from pydantic_ai.agent.abstract import AgentInstructions
 
 _INSTRUCTIONS = (
     "You have Pixeltable catalog tools. Call list_tables and describe_table before querying "
@@ -74,7 +74,14 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
             raise ValueError("tables must be a non-empty allowlist, or ['*'] for the whole catalog")
         if ALL_TABLES in cleaned and cleaned != [ALL_TABLES]:
             raise ValueError("tables=['*'] must be the only entry when allowing the whole catalog")
+        for entry in cleaned:
+            if entry != ALL_TABLES and any(not part or any(ch.isspace() for ch in part) for part in entry.split(".")):
+                raise ValueError(f"invalid tables entry {entry!r}: expected dotted paths like 'my_app.doc_chunks'")
         self.tables = list(cleaned)
+        if self.description is None:
+            self.description = (
+                "Read-only Pixeltable catalog tools: list_tables, describe_table, query_table, similarity_search."
+            )
 
     def get_instructions(self) -> AgentInstructions[AgentDepsT] | None:
         if self.guidance is not None:
@@ -84,11 +91,35 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
             return f"{_INSTRUCTIONS} You may only use these tables or prefixes: {allowed}."
         return _INSTRUCTIONS
 
+    @classmethod
+    def combine(cls, capabilities: Sequence[Pixeltable[AgentDepsT]]) -> Pixeltable[AgentDepsT]:
+        """Merge same-id instances: union of allowlists, tightest row/char caps.
+
+        The default field merge would union ``['*']`` with other entries into a list that the
+        allowlist check then narrows to just those entries, and would take the later (looser)
+        cap rather than the smaller one.
+        """
+        tables: list[str] = []
+        for capability in capabilities:
+            tables.extend(entry for entry in capability.tables or [] if entry not in tables)
+        latest = capabilities[-1]
+        return cls(
+            tables=[ALL_TABLES] if ALL_TABLES in tables else tables,
+            read_only=all(capability.read_only for capability in capabilities),
+            max_rows=min(capability.max_rows for capability in capabilities),
+            max_chars=min(capability.max_chars for capability in capabilities),
+            guidance=next((c.guidance for c in reversed(capabilities) if c.guidance is not None), None),
+            id=latest.id,
+            description=latest.description,
+            defer_loading=latest.defer_loading,
+        )
+
     def get_toolset(self) -> PixeltableToolset[AgentDepsT]:
         return PixeltableToolset[AgentDepsT](
             tables=self.tables,
             max_rows=self.max_rows,
             max_chars=self.max_chars,
+            id=self.id or "pixeltable",
         )
 
     @classmethod
@@ -104,6 +135,7 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
         description: str | None = None,
         defer_loading: bool = False,
     ) -> Pixeltable[AgentDepsT]:
+        """Build from a YAML/dict spec; register with ``Agent.from_spec(custom_capability_types=[Pixeltable])``."""
         if isinstance(tables, str):
             raise ValueError("tables must be a list of paths, not a string")
         return cls(

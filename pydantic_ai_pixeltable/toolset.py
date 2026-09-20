@@ -80,8 +80,8 @@ def _bounded_payload(table: str, rows: list[dict[str, Any]], *, has_more: bool, 
 class PixeltableToolset(FunctionToolset[AgentDepsT]):
     """List, describe, query, and similarity-search Pixeltable tables."""
 
-    def __init__(self, *, tables: list[str] | None, max_rows: int, max_chars: int) -> None:
-        super().__init__()
+    def __init__(self, *, tables: list[str] | None, max_rows: int, max_chars: int, id: str = "pixeltable") -> None:
+        super().__init__(id=id)
         self._tables = tables
         self._handles: dict[str, pxt.Table] = {}
         self._max_rows = max_rows
@@ -97,7 +97,11 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         Returns:
             The allowed table paths.
         """
-        return {"tables": sorted(_norm(path) for path in pxt.list_tables() if _allowed(path, self._tables))}
+        try:
+            tables = pxt.list_tables()
+        except pxt.Error as exc:
+            raise ModelRetry(str(exc)) from exc
+        return {"tables": sorted(_norm(path) for path in tables if _allowed(path, self._tables))}
 
     def describe_table(self, table: str) -> dict[str, Any]:
         """Describe a table's columns and indexes.
@@ -109,19 +113,15 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             Kind, comment, columns, and indexes.
         """
         t = self._open_table(table)
-        try:
-            metadata = t.get_metadata()
-        except pxt.Error as exc:
-            self._handles.pop(table, None)
-            raise ModelRetry(str(exc)) from exc
+        metadata = self._metadata(table, t)
         # pixeltable renamed the metadata key "indices" to "indexes" in 0.7.x.
         indexes = metadata.get("indexes") or metadata.get("indices") or {}
         return {
             "table": _norm(metadata["path"]),
-            "kind": metadata["kind"],
-            "comment": metadata["comment"],
+            "kind": metadata.get("kind"),
+            "comment": metadata.get("comment"),
             "columns": [
-                {"name": info["name"], "type": info["type_"], "is_computed": info["is_computed"]}
+                {"name": info.get("name"), "type": info.get("type_"), "is_computed": info.get("is_computed", False)}
                 for info in metadata["columns"].values()
             ],
             "indexes": [
@@ -150,11 +150,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             Matching rows, with ``truncated`` set when the row or character cap applied.
         """
         t = self._open_table(table)
-        try:
-            metadata = t.get_metadata()
-        except pxt.Error as exc:
-            self._handles.pop(table, None)
-            raise ModelRetry(str(exc)) from exc
+        metadata = self._metadata(table, t)
         query = self._project(t, columns, metadata)
         query = self._where(query, t, where, metadata)
         return self._collect(table, query, limit)
@@ -184,11 +180,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         if not query.strip():
             raise ModelRetry("similarity_search query must be non-empty")
         t = self._open_table(table)
-        try:
-            metadata = t.get_metadata()
-        except pxt.Error as exc:
-            self._handles.pop(table, None)
-            raise ModelRetry(str(exc)) from exc
+        metadata = self._metadata(table, t)
         column_md = metadata["columns"]
         if column not in column_md:
             raise ModelRetry(f"Unknown column {column!r} on {_norm(metadata['path'])!r}. Call describe_table.")
@@ -204,6 +196,16 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         except pxt.Error as exc:
             self._handles.pop(table, None)
             raise ModelRetry(str(exc)) from exc
+
+    def _metadata(self, table: str, t: pxt.Table) -> dict[str, Any]:
+        try:
+            metadata = t.get_metadata()
+        except pxt.Error as exc:
+            self._handles.pop(table, None)
+            raise ModelRetry(str(exc)) from exc
+        if "columns" not in metadata or "path" not in metadata:
+            raise ModelRetry(f"unexpected metadata shape for {table!r}")
+        return metadata
 
     def _open_table(self, table: str) -> pxt.Table:
         if not _allowed(table, self._tables):

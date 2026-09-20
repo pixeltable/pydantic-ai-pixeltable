@@ -157,3 +157,71 @@ def test_agent_from_spec_requires_custom_capability_types() -> None:
     agent = Agent.from_spec(spec, custom_capability_types=[Pixeltable])
     loaded = [cap for cap in agent.root_capability.capabilities if isinstance(cap, Pixeltable)]
     assert loaded[0].tables == ["my_app.doc_chunks"]
+
+
+def test_combine_unions_allowlists_and_tightens_caps() -> None:
+    merged = Pixeltable.combine([Pixeltable(tables=["a"], max_rows=50), Pixeltable(tables=["b"], max_rows=5)])
+    assert merged.tables == ["a", "b"]
+    assert merged.max_rows == 5
+
+    star = Pixeltable.combine([Pixeltable(tables=["a"]), Pixeltable(tables=["*"])])
+    assert star.tables == ["*"]
+
+    agent = Agent(
+        "test",
+        capabilities=[Pixeltable(tables=["x"]), Pixeltable(tables=["y"], max_chars=10)],
+    )
+    caps = [cap for cap in agent.root_capability.capabilities if isinstance(cap, Pixeltable)]
+    assert len(caps) == 1
+    assert caps[0].tables == ["x", "y"]
+    assert caps[0].max_chars == 10
+
+
+def test_tables_rejects_bad_entries() -> None:
+    for bad in (["my_app."], [" "], ["a..b"], [".hidden"]):
+        with pytest.raises(ValueError, match="tables entry"):
+            Pixeltable(tables=bad)
+
+
+def test_views_work_as_catalog_targets(catalog: str) -> None:
+    chunks = pxt.get_table(f"{catalog}.chunks")
+    pxt.create_view(f"{catalog}.open_chunks", chunks.where(chunks.status == "open"))
+    tools = Pixeltable(tables=[f"{catalog}.open_chunks"]).get_toolset()
+
+    described = tools.describe_table(f"{catalog}.open_chunks")
+    assert described["kind"] == "view"
+    assert f"{catalog}.open_chunks" in tools.list_tables()["tables"]
+    result = tools.query_table(f"{catalog}.open_chunks")
+    assert {row["status"] for row in result["rows"]} == {"open"}
+
+
+def test_similarity_idx_disambiguation(catalog: str) -> None:
+    t = pxt.get_table(f"{catalog}.chunks")
+    t.add_embedding_index("text", string_embed=tiny_embed, idx_name="e_a")
+    t.add_embedding_index("text", string_embed=tiny_embed, idx_name="e_b")
+    tools = _tools(catalog)
+
+    with pytest.raises(ModelRetry):
+        tools.similarity_search(f"{catalog}.chunks", "cats sit on mats", "text")
+    result = tools.similarity_search(f"{catalog}.chunks", "cats sit on mats", "text", idx="e_a")
+    assert result["rows"][0]["text"] == "cats sit on mats"
+
+
+def test_tool_error_branches(catalog: str) -> None:
+    tools = _tools(catalog)
+    with pytest.raises(ModelRetry, match="Unknown column"):
+        tools.query_table(f"{catalog}.chunks", columns=["nope"])
+    with pytest.raises(ModelRetry, match="Unknown column"):
+        tools.query_table(f"{catalog}.chunks", where={"nope": 1})
+    with pytest.raises(ModelRetry, match="Unknown column"):
+        tools.similarity_search(f"{catalog}.chunks", "x", "nope")
+    with pytest.raises(ModelRetry, match="non-empty"):
+        tools.similarity_search(f"{catalog}.chunks", "  ", "text")
+    with pytest.raises(ModelRetry, match="at least one column"):
+        tools.query_table(f"{catalog}.chunks", columns=[])
+    with pytest.raises(ModelRetry, match="at least 1"):
+        tools.query_table(f"{catalog}.chunks", limit=0)
+
+    prefix_tools = Pixeltable(tables=[catalog]).get_toolset()
+    with pytest.raises(ModelRetry, match="Cannot open"):
+        prefix_tools.query_table(f"{catalog}.missing")

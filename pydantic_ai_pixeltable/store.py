@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import re
 import threading
 import uuid
 from collections.abc import Iterable
 from typing import Any
 
+import anyio.to_thread
 import pixeltable as pxt
 from pydantic_ai_harness.memory import (
     MemoryConflictError,
@@ -32,8 +32,9 @@ def _reject_reserved_path(path: str) -> None:
         raise ValueError(f"memory path {path!r} is reserved for store bookkeeping")
 
 
-# Path validation and lexical search mirror pydantic_ai_harness.memory._store. Vendored so this
-# package does not depend on a private harness module; keep behavior identical to the originals.
+# Path validation and lexical search mirror pydantic_ai_harness.memory._store (checked against
+# harness 0.32.0). Vendored so this package does not depend on a private harness module; keep
+# behavior identical to the originals.
 
 _VALID_SEGMENT_RE = re.compile(r"[A-Za-z0-9_.-]{1,200}")
 
@@ -145,10 +146,10 @@ class PixeltableMemoryStore:
             return self._ensure_table()
 
     async def read(self, path: str, *, max_chars: int) -> MemoryFile | None:
-        return await asyncio.to_thread(self._locked, self._read_sync, path, max_chars)
+        return await anyio.to_thread.run_sync(self._locked, self._read_sync, path, max_chars)
 
     async def get_operation(self, operation: MemoryOperation) -> MemoryMutation | None:
-        return await asyncio.to_thread(self._locked, self._get_operation_sync, operation)
+        return await anyio.to_thread.run_sync(self._locked, self._get_operation_sync, operation)
 
     async def write(
         self,
@@ -158,7 +159,9 @@ class PixeltableMemoryStore:
         expected_version: str | None,
         operation: MemoryOperation | None = None,
     ) -> MemoryMutation:
-        return await asyncio.to_thread(self._locked, self._write_sync, path, content, expected_version, operation)
+        return await anyio.to_thread.run_sync(
+            self._locked, self._write_sync, path, content, expected_version, operation
+        )
 
     async def delete(
         self,
@@ -167,10 +170,10 @@ class PixeltableMemoryStore:
         expected_version: str | None,
         operation: MemoryOperation | None = None,
     ) -> MemoryMutation:
-        return await asyncio.to_thread(self._locked, self._delete_sync, path, expected_version, operation)
+        return await anyio.to_thread.run_sync(self._locked, self._delete_sync, path, expected_version, operation)
 
     async def list_paths(self, prefix: str = "", *, limit: int) -> list[str]:
-        return await asyncio.to_thread(self._locked, self._list_paths_sync, prefix, limit)
+        return await anyio.to_thread.run_sync(self._locked, self._list_paths_sync, prefix, limit)
 
     async def search(
         self,
@@ -182,7 +185,7 @@ class PixeltableMemoryStore:
         max_chars: int,
         max_file_chars: int,
     ) -> MemorySearchResult:
-        return await asyncio.to_thread(
+        return await anyio.to_thread.run_sync(
             self._locked, self._search_sync, prefix, query, limit, max_files, max_chars, max_file_chars
         )
 
@@ -252,23 +255,31 @@ class PixeltableMemoryStore:
         version = None if row["version"] is None else str(row["version"])
         return MemoryMutation(version=version, replayed=True, existed=bool(row["existed"]))
 
-    def _record_operation(self, t: pxt.Table, operation: MemoryOperation | None, mutation: MemoryMutation) -> None:
+    def _record_operation(
+        self, t: pxt.Table, operation: MemoryOperation | None, mutation: MemoryMutation
+    ) -> MemoryMutation | None:
         if operation is None:
-            return
-        _insert_rows(
-            t,
-            [
-                {
-                    "path": f"{_OP_PREFIX}{operation.id}",
-                    "kind": _KIND_OP,
-                    "content": None,
-                    "version": mutation.version,
-                    "last_operation_id": None,
-                    "fingerprint": operation.fingerprint,
-                    "existed": mutation.existed,
-                }
-            ],
-        )
+            return None
+        try:
+            _insert_rows(
+                t,
+                [
+                    {
+                        "path": f"{_OP_PREFIX}{operation.id}",
+                        "kind": _KIND_OP,
+                        "content": None,
+                        "version": mutation.version,
+                        "last_operation_id": None,
+                        "fingerprint": operation.fingerprint,
+                        "existed": mutation.existed,
+                    }
+                ],
+            )
+        except MemoryConflictError:
+            # Another writer already recorded this operation id; return its receipt (or raise
+            # MemoryOperationConflictError on a fingerprint mismatch) instead of a bare conflict.
+            return self._lookup_operation(t, operation)
+        return None
 
     def _read_sync(self, path: str, max_chars: int) -> MemoryFile | None:
         _validate_store_path(path)
@@ -332,8 +343,7 @@ class PixeltableMemoryStore:
             if status.row_count_stats.upd_rows != 1:
                 raise MemoryConflictError(f"memory path {path!r} changed before it could be written")
         mutation = MemoryMutation(version=version, replayed=False, existed=row is not None)
-        self._record_operation(t, operation, mutation)
-        return mutation
+        return self._record_operation(t, operation, mutation) or mutation
 
     def _delete_sync(
         self,
@@ -357,8 +367,7 @@ class PixeltableMemoryStore:
             if status.row_count_stats.del_rows != 1:
                 raise MemoryConflictError(f"memory path {path!r} changed before it could be deleted")
         mutation = MemoryMutation(version=None, replayed=False, existed=row is not None)
-        self._record_operation(t, operation, mutation)
-        return mutation
+        return self._record_operation(t, operation, mutation) or mutation
 
     def _file_query(self, t: pxt.Table, prefix: str) -> Any:
         pred = t.kind == _KIND_FILE

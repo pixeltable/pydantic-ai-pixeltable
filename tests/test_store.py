@@ -210,3 +210,66 @@ async def test_concurrent_create_across_instances_is_conflict(store: PixeltableM
 def test_implements_public_protocols(store: PixeltableMemoryStore) -> None:
     assert isinstance(store, MemoryStore)
     assert isinstance(store, SearchableMemoryStore)
+
+
+async def test_concurrent_same_operation_id_replays(store: PixeltableMemoryStore) -> None:
+    other = PixeltableMemoryStore(table_name=store._table_name)
+    operation = MemoryOperation(id="run-1:call-x", fingerprint="delete:missing.md")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda s: s._delete_sync("missing.md", None, operation), [store, other]))
+    assert {r.replayed for r in results} == {False, True}
+    assert all(r.existed is False for r in results)
+
+
+async def test_rejects_reserved_paths_on_read_and_delete(store: PixeltableMemoryStore) -> None:
+    for path in ("__op__/run-1", "__meta__/generation"):
+        with pytest.raises(ValueError):
+            await store.read(path, max_chars=10)
+        with pytest.raises(ValueError):
+            await store.delete(path, expected_version=None)
+
+
+async def test_argument_validation(store: PixeltableMemoryStore) -> None:
+    with pytest.raises(ValueError):
+        await store.read("a.md", max_chars=0)
+    with pytest.raises(ValueError):
+        await store.list_paths(limit=0)
+    with pytest.raises(ValueError):
+        await store.list_paths("../x", limit=10)
+    with pytest.raises(ValueError):
+        await store.search("bad prefix/", "q", limit=1, max_files=1, max_chars=1, max_file_chars=1)
+
+
+def test_int_version_table_rejected() -> None:
+    name = f"test_pydantic_ai.legacy_{uuid.uuid4().hex[:8]}"
+    pxt.create_dir("test_pydantic_ai", if_exists="ignore")
+    try:
+        pxt.create_table(
+            name,
+            {"path": pxt.Required[pxt.String], "version": pxt.Int | None},
+            primary_key="path",
+        )
+        with pytest.raises(ValueError, match="Int version"):
+            _ = PixeltableMemoryStore(table_name=name).table
+    finally:
+        pxt.drop_table(name, force=True)
+
+
+def test_vendored_helpers_match_harness() -> None:
+    from pydantic_ai_harness.memory._store import lexical_search, validate_store_path
+
+    from pydantic_ai_pixeltable.store import _lexical_search, _validate_store_path
+
+    for bad in ("../x", "a//b", "a b"):
+        for fn in (validate_store_path, _validate_store_path):
+            with pytest.raises(ValueError):
+                fn(bad)
+    for good in ("a/b.md", "x"):
+        validate_store_path(good)
+        _validate_store_path(good)
+
+    files = [("a.md", "alpha beta"), ("b.md", "alpha")]
+    ours = _lexical_search(files, "alpha", limit=10, max_files=10, max_chars=1_000)
+    theirs = lexical_search(files, "alpha", limit=10, max_files=10, max_chars=1_000)
+    assert ours == theirs
