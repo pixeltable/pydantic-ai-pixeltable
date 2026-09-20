@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install ruff==0.11.12  # match .pre-commit-config.yaml
+      - run: pip install ruff==0.16.8  # match .pre-commit-config.yaml
       - run: ruff check .
       - run: ruff format --check .
 
