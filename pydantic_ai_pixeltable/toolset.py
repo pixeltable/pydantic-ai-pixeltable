@@ -80,6 +80,8 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
 
     def __init__(self, *, tables: list[str] | None, max_rows: int, max_chars: int, id: str = "pixeltable") -> None:
         super().__init__(id=id)
+        if not tables:
+            raise ValueError("tables must be a non-empty allowlist; pass ['*'] to allow the whole catalog")
         self._tables = tables
         self._handles: dict[str, pxt.Table] = {}
         self._max_rows = max_rows
@@ -141,7 +143,8 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             table: Pixeltable table path.
             columns: Columns to return. Omit to skip media, array, and binary.
                 A named media column is returned as a file URL.
-            where: Equality filters mapping column name to value.
+            where: Equality filters mapping column name to value. Media, array, and
+                binary columns reject non-null filters; ``None`` matches null rows.
             limit: Maximum rows to return, capped by the capability.
 
         Returns:
@@ -149,7 +152,10 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         """
         t = self._open_table(table)
         metadata = self._metadata(table, t)
-        query = self._project(t, columns, metadata)
+        try:
+            query = self._project(t, columns, metadata)
+        except (pxt.Error, TypeError, ValueError) as exc:
+            raise ModelRetry(str(exc)) from exc
         query = self._where(query, t, where, metadata)
         return self._collect(table, query, limit)
 
@@ -263,7 +269,8 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         for name, value in where.items():
             if name not in column_md:
                 raise ModelRetry(f"Unknown column {name!r} in where. Call describe_table.")
-            if _is_skipped_type(column_md[name]["type_"]):
+            type_ = column_md[name]["type_"]
+            if value is not None and (_is_skipped_type(type_) or _is_media_type(type_)):
                 raise ModelRetry(f"Column {name!r} does not support equality filters. Call describe_table.")
             if value is not None and not isinstance(value, (str, int, float, bool)):
                 raise ModelRetry(f"where value for {name!r} must be a scalar, got {type(value).__name__}")

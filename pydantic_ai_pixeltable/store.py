@@ -256,9 +256,11 @@ class PixeltableMemoryStore:
     def _check_compatible_schema(self, t: pxt.Table) -> None:
         """Reject a pre-existing table whose schema cannot back the MemoryStore protocol."""
         metadata = t.get_metadata()
-        kind = metadata.get("kind", "table")
+        kind = metadata.get("kind")
         if kind != "table":
-            raise ValueError(f"{self._table_name!r} is a {kind}; the memory store needs a writable table")
+            raise ValueError(
+                f"{self._table_name!r} is a {kind or 'non-table object'}; the memory store needs a writable table"
+            )
         columns = metadata.get("columns") or {}
         # 'Required[' appears only in 0.6.x's schema-style type_ rendering; seeing it means a
         # bare 'T' marks a nullable column rather than a non-nullable one.
@@ -288,7 +290,7 @@ class PixeltableMemoryStore:
         if primary_key is not None:
             if list(primary_key) != ["path"]:
                 problems.append(f"primary key is {list(primary_key)!r}, expected ['path']")
-        elif (columns.get("path") or {}).get("is_primary_key") is False:
+        elif (columns.get("path") or {}).get("is_primary_key") is not True:
             problems.append("column 'path' has no primary key constraint")
         if problems:
             raise ValueError(

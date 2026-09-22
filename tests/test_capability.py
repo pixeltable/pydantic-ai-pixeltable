@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pixeltable as pxt
@@ -12,7 +13,7 @@ import pytest
 from pydantic_ai import Agent
 from pydantic_ai.exceptions import ModelRetry
 
-from pydantic_ai_pixeltable import Pixeltable
+from pydantic_ai_pixeltable import Pixeltable, PixeltableToolset
 from tests.embed import DIM, tiny_embed
 
 
@@ -48,6 +49,14 @@ def _tools(root: str, *, max_rows: int = 20, max_chars: int = 8000):
 def test_read_only_false_rejected() -> None:
     with pytest.raises(ValueError, match="read_only"):
         Pixeltable(read_only=False)
+
+
+def test_toolset_requires_explicit_allowlist() -> None:
+    # None must not silently mean the whole catalog; that is an opt-in via ['*'].
+    for tables in (None, []):
+        with pytest.raises(ValueError, match="allowlist"):
+            PixeltableToolset(tables=tables, max_rows=10, max_chars=100)
+    assert PixeltableToolset(tables=["*"], max_rows=10, max_chars=100) is not None
 
 
 def test_tables_required_and_star(catalog: str) -> None:
@@ -233,6 +242,24 @@ def test_tool_error_branches(catalog: str) -> None:
     with pytest.raises(ModelRetry, match="equality filters"):
         tools.query_table(f"{catalog}.chunks", where={"vec": 5})
 
+    # Media columns never match an equality filter; None still selects null rows.
+    docs = pxt.create_table(f"{catalog}.docs", {"title": pxt.String, "doc": pxt.Document | None})
+    docs.insert([{"title": "a", "doc": None}])
+    doc_tools = Pixeltable(tables=[f"{catalog}.docs"]).get_toolset()
+    with pytest.raises(ModelRetry, match="equality filters"):
+        doc_tools.query_table(f"{catalog}.docs", where={"doc": "x"})
+    assert [row["title"] for row in doc_tools.query_table(f"{catalog}.docs", where={"doc": None})["rows"]] == ["a"]
+
     prefix_tools = Pixeltable(tables=[catalog]).get_toolset()
     with pytest.raises(ModelRetry, match="Cannot open"):
         prefix_tools.query_table(f"{catalog}.missing")
+
+
+def test_projection_errors_become_retries(catalog: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Expression construction in _project must not escape the tool as a hard error.
+    def boom(*args: Any, **kwargs: Any) -> Any:
+        raise pxt.NotFoundError(pxt.ErrorCode.PATH_NOT_FOUND, "synthetic select failure")
+
+    monkeypatch.setattr(pxt.Table, "select", boom)
+    with pytest.raises(ModelRetry, match="synthetic"):
+        _tools(catalog).query_table(f"{catalog}.chunks")
