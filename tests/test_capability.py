@@ -221,7 +221,7 @@ def test_similarity_idx_disambiguation(catalog: str) -> None:
     assert result["rows"][0]["text"] == "cats sit on mats"
 
 
-def test_tool_error_branches(catalog: str) -> None:
+def test_tool_error_branches(catalog: str, tmp_path: Path) -> None:
     tools = _tools(catalog)
     with pytest.raises(ModelRetry, match="Unknown column"):
         tools.query_table(f"{catalog}.chunks", columns=["nope"])
@@ -242,13 +242,16 @@ def test_tool_error_branches(catalog: str) -> None:
     with pytest.raises(ModelRetry, match="equality filters"):
         tools.query_table(f"{catalog}.chunks", where={"vec": 5})
 
-    # Media columns never match an equality filter; None still selects null rows.
-    docs = pxt.create_table(f"{catalog}.docs", {"title": pxt.String, "doc": pxt.Document | None})
-    docs.insert([{"title": "a", "doc": None}])
+    # Media columns never match an equality filter; None is still an IS NULL filter.
+    note_file = tmp_path / "note.md"
+    note_file.write_text("x")
+    docs = pxt.create_table(f"{catalog}.docs", {"title": pxt.String, "note": pxt.String | None, "doc": pxt.Document})
+    docs.insert([{"title": "a", "note": None, "doc": str(note_file)}])
     doc_tools = Pixeltable(tables=[f"{catalog}.docs"]).get_toolset()
     with pytest.raises(ModelRetry, match="equality filters"):
         doc_tools.query_table(f"{catalog}.docs", where={"doc": "x"})
-    assert [row["title"] for row in doc_tools.query_table(f"{catalog}.docs", where={"doc": None})["rows"]] == ["a"]
+    assert doc_tools.query_table(f"{catalog}.docs", where={"doc": None})["rows"] == []
+    assert [row["title"] for row in doc_tools.query_table(f"{catalog}.docs", where={"note": None})["rows"]] == ["a"]
 
     prefix_tools = Pixeltable(tables=[catalog]).get_toolset()
     with pytest.raises(ModelRetry, match="Cannot open"):
