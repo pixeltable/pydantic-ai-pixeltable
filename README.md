@@ -1,6 +1,7 @@
 # pydantic-ai-pixeltable
 
 [![CI](https://github.com/pixeltable/pydantic-ai-pixeltable/actions/workflows/ci.yml/badge.svg)](https://github.com/pixeltable/pydantic-ai-pixeltable/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/pydantic-ai-pixeltable.svg)](https://pypi.org/project/pydantic-ai-pixeltable/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 [Pydantic AI Harness](https://github.com/pydantic/pydantic-ai-harness) integration for [Pixeltable](https://pixeltable.com/). Two independent layers:
@@ -8,14 +9,14 @@
 - `PixeltableMemoryStore`: persist Harness `Memory` in a Pixeltable table (same `Memory(store)` slot as `FileStore`)
 - `Pixeltable`: read-only catalog tools (`list_tables`, `describe_table`, `query_table`, `similarity_search`) over tables you already have
 
-Neither requires the other. Requires **Pixeltable >= 0.6.8** and **pydantic-ai-harness >= 0.29.0**. Not on PyPI yet.
+Neither requires the other. Requires **Pixeltable >= 0.6.8** and **pydantic-ai-harness >= 0.29.0**.
 
 This is an interoperability bridge. Native Pixeltable agents still use a `TableModel` and computed columns.
 
 ## Installation
 
 ```bash
-pip install git+https://github.com/pixeltable/pydantic-ai-pixeltable.git
+pip install pydantic-ai-pixeltable
 ```
 
 ## Quick Start
