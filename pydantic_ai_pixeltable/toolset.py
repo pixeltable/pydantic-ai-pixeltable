@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import uuid
+from collections.abc import Callable
+from datetime import date, datetime
 from typing import Any, TypedDict, cast
 
 import pixeltable as pxt
@@ -42,6 +45,14 @@ _WHERE_VALUE_TYPES: dict[str, type | tuple[type, ...]] = {
     "Bool": bool,
     "Timestamp": str,
     "Date": str,
+    "UUID": str,
+}
+
+# JSON has no timestamp, date, or UUID; the model sends ISO strings, which must be parsed to match.
+_WHERE_PARSERS: dict[str, Callable[[str], Any]] = {
+    "Timestamp": datetime.fromisoformat,
+    "Date": date.fromisoformat,
+    "UUID": uuid.UUID,
 }
 
 
@@ -49,10 +60,11 @@ def _norm(path: str) -> str:
     return path.replace("/", ".")
 
 
-def _allowed(path: str, tables: list[str] | None) -> bool:
-    if tables is None or tables == [ALL_TABLES]:
+def _allowed(path: str, tables: list[str]) -> bool:
+    if tables == [ALL_TABLES]:
         return True
-    npath = _norm(path)
+    # A version handle ('tbl:3') is allowed exactly when its table is.
+    npath = _norm(path).split(":", 1)[0]
     return any(npath == _norm(entry) or npath.startswith(f"{_norm(entry)}.") for entry in tables)
 
 
@@ -90,43 +102,58 @@ def _row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: _cell(value) for key, value in row.items()}
 
 
+def _clip(value: Any, budget: int) -> Any:
+    """``value`` if its JSON fits in ``budget`` characters, else a cut string of it ending in ``...``."""
+    encoded = json.dumps(value, ensure_ascii=False)
+    if len(encoded) <= budget:
+        return value
+    text = value if isinstance(value, str) else encoded
+    keep = budget - 5  # quotes plus '...'
+    # Escapes make the JSON longer than the text; shrink in proportion until it fits.
+    while keep > 0 and (size := len(json.dumps(text[:keep], ensure_ascii=False))) + 3 > budget:
+        keep = min(keep - 1, keep * (budget - 3) // size)
+    return f"{text[:keep]}..." if keep > 0 else "..."
+
+
 def _bounded_payload(table: str, rows: list[dict[str, Any]], *, has_more: bool, max_chars: int) -> RowsResult:
-    kept = [dict(row) for row in rows]
+    """Keep leading rows while the JSON fits in ``max_chars``.
+
+    The first row that does not fit has its cells cut to share the remaining room (short cells
+    first, so they stay whole), so one oversized value cannot empty the result. Rows after it
+    are dropped.
+    """
+    kept: list[dict[str, Any]] = []
     truncated = has_more
-    while True:
-        payload = RowsResult(table=table, rows=kept, truncated=truncated)
-        encoded = json.dumps(payload, ensure_ascii=False)
-        if len(encoded) <= max_chars:
-            return payload
-        if not kept:
-            return RowsResult(table=table, rows=[], truncated=True)
-        # Prefer trimming the longest string cell over dropping the whole row, so one
-        # oversized value cannot empty the result.
-        longest_len = 0
-        longest_row = longest_key = None
-        for index, row in enumerate(kept):
-            for key, value in row.items():
-                if isinstance(value, str) and len(value) > longest_len:
-                    longest_len, longest_row, longest_key = len(value), index, key
-        if longest_len == 0 or longest_row is None or longest_key is None:
-            kept.pop()
-            truncated = True
+    used = len(json.dumps(RowsResult(table=table, rows=[], truncated=False), ensure_ascii=False))
+    for row in rows:
+        separator = 2 if kept else 0
+        size = len(json.dumps(row, ensure_ascii=False)) + separator
+        if used + size <= max_chars:
+            kept.append(row)
+            used += size
             continue
-        cut = max(longest_len - (len(encoded) - max_chars) - 3, 0)
-        value = kept[longest_row][longest_key]
-        kept[longest_row][longest_key] = f"{value[:cut]}..." if cut else ""
         truncated = True
+        sizes = {key: len(json.dumps(value, ensure_ascii=False)) for key, value in row.items()}
+        room = max_chars - used - separator - (len(json.dumps(dict.fromkeys(row, 0), ensure_ascii=False)) - len(row))
+        budgets: dict[str, int] = {}
+        for index, key in enumerate(sorted(sizes, key=sizes.__getitem__)):
+            budgets[key] = min(sizes[key], room // (len(sizes) - index))
+            room -= budgets[key]
+        clipped = {key: _clip(value, budgets[key]) for key, value in row.items()}
+        if used + separator + len(json.dumps(clipped, ensure_ascii=False)) <= max_chars:
+            kept.append(clipped)
+        break
+    return RowsResult(table=table, rows=kept, truncated=truncated)
 
 
 class PixeltableToolset(FunctionToolset[AgentDepsT]):
     """List, describe, query, and similarity-search Pixeltable tables."""
 
-    def __init__(self, *, tables: list[str] | None, max_rows: int, max_chars: int, id: str = "pixeltable") -> None:
+    def __init__(self, *, tables: list[str], max_rows: int, max_chars: int, id: str = "pixeltable") -> None:
         super().__init__(id=id)
         if not tables:
             raise ValueError("tables must be a non-empty allowlist; pass ['*'] to allow the whole catalog")
         self._tables = tables
-        self._handles: dict[str, pxt.Table] = {}
         self._max_rows = max_rows
         self._max_chars = max_chars
         self.add_function(self.list_tables, name="list_tables")
@@ -157,14 +184,19 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         """
         t = self._open_table(table)
         metadata = self._metadata(table, t)
-        # pixeltable renamed the metadata key "indices" to "indexes" in 0.7.x.
-        indexes = metadata.get("indexes") or metadata.get("indices") or {}
+        indexes = metadata.get("indexes") or {}
         return TableDescription(
             table=_norm(metadata["path"]),
             kind=metadata.get("kind"),
             comment=metadata.get("comment"),
             columns=[
-                {"name": info.get("name"), "type": info.get("type_"), "is_computed": info.get("is_computed", False)}
+                {
+                    "name": info.get("name"),
+                    "type": info.get("type_"),
+                    "is_computed": info.get("is_computed", False),
+                    # An unstored computed column reruns its function (maybe a paid model call) per row read.
+                    "is_stored": info.get("is_stored", True),
+                }
                 for info in metadata["columns"].values()
             ],
             indexes=[
@@ -223,7 +255,8 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             idx: Embedding index name. Required when the column has more than one index.
 
         Returns:
-            Rows ordered by similarity, each with a `score` field.
+            Rows ordered by similarity, each with a `score` field (`similarity_score` when the
+            table has its own `score` column).
         """
         if not query.strip():
             raise ModelRetry("similarity_search query must be non-empty")
@@ -246,14 +279,12 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             query_obj = self._project(t, selected, metadata, **{score_name: search}).order_by(search, asc=False)
             return self._collect(table, query_obj, limit)
         except pxt.Error as exc:
-            self._handles.pop(table, None)
             raise ModelRetry(str(exc)) from exc
 
     def _metadata(self, table: str, t: pxt.Table) -> dict[str, Any]:
         try:
             metadata = cast(dict[str, Any], t.get_metadata())
         except pxt.Error as exc:
-            self._handles.pop(table, None)
             raise ModelRetry(str(exc)) from exc
         if "columns" not in metadata or "path" not in metadata:
             raise ModelRetry(f"unexpected metadata shape for {table!r}")
@@ -262,15 +293,13 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
     def _open_table(self, table: str) -> pxt.Table:
         if not _allowed(table, self._tables):
             raise ModelRetry(f"Table {table!r} is not in the Pixeltable allowlist. Call list_tables.")
-        cached = self._handles.get(table)
-        if cached is not None:
-            return cached
+        # No handle cache: resolving the name on every call keeps a moved or dropped table
+        # from being served under an allowlisted name.
         try:
             t = pxt.get_table(table)
         except pxt.Error as exc:
             raise ModelRetry(f"Cannot open table {table!r}: {exc}") from exc
         assert t is not None  # if_not_exists='error' raises instead of returning None
-        self._handles[table] = t
         return t
 
     def _default_columns(self, metadata: dict[str, Any]) -> list[str]:
@@ -322,7 +351,10 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         for name, value in where.items():
             if name not in column_md:
                 raise ModelRetry(f"Unknown column {name!r} in where. Call describe_table.")
-            type_ = column_md[name]["type_"]
+            info = column_md[name]
+            type_ = info["type_"]
+            if info.get("is_computed") and not info.get("is_stored"):
+                raise ModelRetry(f"Column {name!r} is computed on read; filtering on it would run it for every row.")
             if value is not None and (_is_skipped_type(type_) or _is_media_type(type_)):
                 raise ModelRetry(f"Column {name!r} does not support equality filters. Call describe_table.")
             if value is not None and not isinstance(value, (str, int, float, bool)):
@@ -335,6 +367,12 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
                 and (not isinstance(value, expected) or (isinstance(value, bool) and base != "Bool"))
             ):
                 raise ModelRetry(f"where value for {name!r} must be {base}, got {type(value).__name__}")
+            parse = _WHERE_PARSERS.get(base)
+            if parse is not None and value is not None:
+                try:
+                    value = parse(str(value))  # already checked to be str above
+                except ValueError as exc:
+                    raise ModelRetry(f"where value for {name!r} must be an ISO-format {base}: {exc}") from exc
             try:
                 clause = t[name] == value
                 pred = clause if pred is None else pred & clause
@@ -352,7 +390,6 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         try:
             fetched = list(query.limit(n + 1).collect())
         except pxt.Error as exc:
-            self._handles.pop(table, None)
             raise ModelRetry(str(exc)) from exc
         has_more = len(fetched) > n
         rows = [_row(dict(row)) for row in fetched[:n]]

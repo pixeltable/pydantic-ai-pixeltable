@@ -356,7 +356,8 @@ def test_existing_memory_table_is_reused() -> None:
             },
             primary_key="path",
         )
-        assert PixeltableMemoryStore(table_name=name).table is not None
+        # Tables created without the path index (e.g. by 0.1.0) get it on first open.
+        assert "path_lookup_idx" in PixeltableMemoryStore(table_name=name).table.get_metadata()["indexes"]
     finally:
         pxt.drop_table(name, force=True)
 
@@ -468,40 +469,14 @@ async def test_prepared_delete_rolls_forward(store: PixeltableMemoryStore) -> No
     assert await store.read("d.md", max_chars=10) is None
 
 
-async def test_compact_preserves_live_state(store: PixeltableMemoryStore) -> None:
-    operation = MemoryOperation(id="run-1:call-13", fingerprint="write:keep.md:a")
-    created = await store.write("keep.md", "a", expected_version=None, operation=operation)
-    gone = await store.write("gone.md", "x", expected_version=None)
-    assert gone.version is not None
-    await store.delete("gone.md", expected_version=gone.version)
-    updated = await store.write("keep.md", "b", expected_version=created.version)
+def test_column_base_and_nullability() -> None:
+    from pydantic_ai_pixeltable._types import column_base, is_nullable_type
 
-    store.compact()
-
-    file = await store.read("keep.md", max_chars=100)
-    assert file is not None
-    assert file.content == "b"
-    assert file.version == updated.version
-    assert await store.list_paths("", limit=50) == ["keep.md"]
-    replay = await store.get_operation(operation)
-    assert replay is not None
-    assert replay.replayed
-    assert replay.version == created.version
-    await store.write("new.md", "n", expected_version=None)
-    assert await store.list_paths("", limit=50) == ["keep.md", "new.md"]
-
-
-def test_column_base_covers_both_type_renderings() -> None:
-    from pydantic_ai_pixeltable._types import column_base
-
-    # 0.7.x repr style: 'T' non-nullable, 'T | None' nullable.
     assert column_base("String") == "String"
     assert column_base("String | None") == "String"
     assert column_base("Array[(8,), float32] | None") == "Array"
-    # 0.6.x schema style: 'Required[T]' non-nullable, 'T' nullable.
-    assert column_base("Required[String]") == "String"
-    assert column_base("Required[Array[(8,), float32]]") == "Array"
-    assert column_base("Bool") == "Bool"
+    assert not is_nullable_type("String")
+    assert is_nullable_type("Array[(8,), float32] | None")
 
 
 def test_vendored_helpers_match_harness() -> None:
@@ -560,49 +535,41 @@ async def test_conflicted_mutation_adopts_peer_receipt(
     assert file.content == "c2"
 
 
-async def test_conflicted_mutation_keeps_prepared_receipt(
-    store: PixeltableMemoryStore, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("mutation", ["write", "delete"])
+async def test_conflicted_mutation_withdraws_prepared_receipt(
+    store: PixeltableMemoryStore, monkeypatch: pytest.MonkeyPatch, mutation: str
 ) -> None:
-    # An unrelated writer moved the path after we journaled. The conflict must surface,
-    # and the receipt must stay prepared (wedged for resolution, like FileStore) rather
-    # than being dropped into a silent retry.
-    operation = MemoryOperation(id="run-1:call-21", fingerprint="write:q.md:c2")
+    # An unrelated writer (another process) moves the path after we journal. Our mutation
+    # never landed, so the intent is withdrawn and the harness retry with the same
+    # operation id writes cleanly instead of hitting the stale intent forever.
+    base = await store.write("q.md", "base", expected_version=None)
+    operation = MemoryOperation(id=f"run-1:call-21-{mutation}", fingerprint=f"{mutation}:q.md")
     original = PixeltableMemoryStore._prepare_operation
 
     def prepare(self: PixeltableMemoryStore, t: pxt.Table, op: MemoryOperation, *args: Any) -> Any:
         receipt = original(self, t, op, *args)
         if receipt is None and op.id == operation.id:
-            _insert_rows(
-                t,
-                [
-                    {
-                        "path": "q.md",
-                        "kind": "file",
-                        "content": "unrelated",
-                        "version": "other-v",
-                        "last_operation_id": None,
-                        "fingerprint": None,
-                        "existed": None,
-                    }
-                ],
-            )
+            peer = PixeltableMemoryStore(table_name=self._table_name)
+            peer._write_sync("q.md", "peer", base.version, None)
         return receipt
 
     monkeypatch.setattr(PixeltableMemoryStore, "_prepare_operation", prepare)
     with pytest.raises(MemoryConflictError):
-        await store.write("q.md", "c2", expected_version=None, operation=operation)
-    rows = store.table.where(store.table.path == f"__op__/{operation.id}").select(store.table.content).collect()
-    assert rows[0]["content"] is not None
+        if mutation == "write":
+            await store.write("q.md", "ours", expected_version=base.version, operation=operation)
+        else:
+            await store.delete("q.md", expected_version=base.version, operation=operation)
+    monkeypatch.undo()
+    assert await store.get_operation(operation) is None
 
-
-def test_compact_refuses_tables_with_user_columns_or_indexes() -> None:
-    name = f"test_pydantic_ai.compact_{uuid.uuid4().hex[:8]}"
-    pxt.create_dir("test_pydantic_ai", if_exists="ignore")
-    store = PixeltableMemoryStore(table_name=name)
-    t = store.table
-    t.add_computed_column(extra_col=t.kind)  # stored computed column a compact would drop
-    try:
-        with pytest.raises(ValueError, match="compact"):
-            store.compact()
-    finally:
-        pxt.drop_table(name, force=True, if_not_exists="ignore")
+    current = await store.read("q.md", max_chars=100)
+    assert current is not None and current.content == "peer"
+    if mutation == "write":
+        retried = await store.write("q.md", "ours", expected_version=current.version, operation=operation)
+        assert not retried.replayed
+        after = await store.read("q.md", max_chars=100)
+        assert after is not None and after.content == "ours"
+    else:
+        retried = await store.delete("q.md", expected_version=current.version, operation=operation)
+        assert not retried.replayed
+        assert await store.read("q.md", max_chars=100) is None

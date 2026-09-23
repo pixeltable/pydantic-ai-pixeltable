@@ -150,7 +150,6 @@ _SCHEMA_COLUMNS = {
 # File rows and `__op__` receipts each write None to some of these, so they must be nullable.
 _NULLABLE_COLUMNS = frozenset({"content", "version", "last_operation_id", "fingerprint", "existed"})
 
-# The primary-key constraint indexes left(path, 256), which cannot serve point lookups on `path`.
 _PATH_INDEX = "path_lookup_idx"
 
 
@@ -196,47 +195,6 @@ class PixeltableMemoryStore:
         """Underlying Pixeltable table for computed columns and queries."""
         with self._lock:
             return self._ensure_table()
-
-    def compact(self) -> None:
-        """Rebuild the table from live rows, reclaiming storage held by old row versions.
-
-        Pixeltable keeps every updated or deleted row version; nothing short of a rebuild
-        reclaims them. Run with writers paused: a mutation landing on the old table
-        mid-compact is lost when the new table takes its place.
-
-        The rebuild carries only the memory schema, so it refuses rather than silently drop
-        user-added columns or indexes (e.g. an embedding index on ``content``). A view that
-        depends on the table must be recreated after the swap.
-        """
-        with self._lock:
-            t = self._ensure_table()
-            metadata = cast(dict[str, Any], t.get_metadata())
-            extra = [name for name in (metadata.get("columns") or {}) if name not in _SCHEMA_COLUMNS]
-            indexes = (metadata.get("indexes") or metadata.get("indices") or {}).keys()
-            user_indexes = [name for name in indexes if name != _PATH_INDEX]
-            if extra or user_indexes:
-                details = ", ".join([*(f"column {n!r}" for n in extra), *(f"index {n!r}" for n in user_indexes)])
-                raise ValueError(f"compact() would drop {details}; remove them or copy rows manually")
-            suffix = uuid.uuid4().hex[:8]
-            scratch_name = f"{self._table_name}__compact_{suffix}"
-            retired_name = f"{self._table_name}__retired_{suffix}"
-            rows = [
-                {name: row[name] for name in _SCHEMA_COLUMNS}
-                for row in t.select(*(t[name] for name in _SCHEMA_COLUMNS)).collect()
-            ]
-            scratch = pxt.create_table(scratch_name, _memory_schema(), primary_key="path")
-            self._add_path_index(scratch)
-            for offset in range(0, len(rows), 5_000):
-                scratch.insert(rows[offset : offset + 5_000])
-            pxt.move(self._table_name, retired_name)
-            try:
-                pxt.move(scratch_name, self._table_name)
-            except BaseException:
-                # Restore the original name; both suffixed tables stay for manual recovery.
-                pxt.move(retired_name, self._table_name, if_exists="ignore")
-                raise
-            pxt.drop_table(retired_name)
-            self._table = None
 
     async def read(self, path: str, *, max_chars: int) -> MemoryFile | None:
         return await anyio.to_thread.run_sync(self._locked, self._read_sync, path, max_chars)
@@ -306,25 +264,16 @@ class PixeltableMemoryStore:
         try:
             t = pxt.get_table(self._table_name)
         except pxt.NotFoundError:
-            t = None
-        if t is not None:
-            self._check_compatible_schema(t)
-            self._table = t
-            return t
-        self._ensure_dirs()
-        t = pxt.create_table(self._table_name, _memory_schema(), primary_key="path", if_exists="ignore")
-        # if_exists='ignore' can also return a table a concurrent writer just created; check it too.
+            self._ensure_dirs()
+            # if_exists='ignore' can also return a table a concurrent writer just created; it is checked below.
+            t = pxt.create_table(self._table_name, _memory_schema(), primary_key="path", if_exists="ignore")
+        assert t is not None  # get_table's default if_not_exists='error' raises instead of returning None
         self._check_compatible_schema(t)
-        self._add_path_index(t)
+        # The primary key indexes left(path, 256), which cannot serve exact-path lookups. Tables
+        # created before this index existed get it on first open.
+        t.add_btree_index("path", idx_name=_PATH_INDEX, if_exists="ignore")
         self._table = t
         return t
-
-    def _add_path_index(self, t: pxt.Table) -> None:
-        # The primary key indexes left(path, 256); a btree serves exact-path lookups.
-        try:
-            t.add_btree_index("path", idx_name=_PATH_INDEX, if_exists="ignore")
-        except pxt.Error:
-            pass  # an optimization only; the store still works without it
 
     def _check_compatible_schema(self, t: pxt.Table) -> None:
         """Reject a pre-existing table whose schema cannot back the MemoryStore protocol."""
@@ -335,9 +284,6 @@ class PixeltableMemoryStore:
                 f"{self._table_name!r} is a {kind or 'non-table object'}; the memory store needs a writable table"
             )
         columns = metadata.get("columns") or {}
-        # 'Required[' appears only in old pixeltable's schema-style type_ rendering; seeing it
-        # means a bare 'T' marks a nullable column rather than a non-nullable one.
-        legacy_schema = any(str(info.get("type_")).startswith("Required[") for info in columns.values())
         problems: list[str] = []
         for name, expected in _SCHEMA_COLUMNS.items():
             info = columns.get(name)
@@ -350,14 +296,10 @@ class PixeltableMemoryStore:
             type_ = str(info.get("type_"))
             if column_base(type_) != expected:
                 problems.append(f"column {name!r} has type {type_!r}, expected {expected!r}")
-            elif name in _NULLABLE_COLUMNS and not is_nullable_type(type_, legacy_schema):
+            elif name in _NULLABLE_COLUMNS and not is_nullable_type(type_):
                 problems.append(f"column {name!r} is not nullable; the store writes None to it")
         for name, info in columns.items():
-            if (
-                name not in _SCHEMA_COLUMNS
-                and not info.get("is_computed")
-                and not is_nullable_type(info.get("type_"), legacy_schema)
-            ):
+            if name not in _SCHEMA_COLUMNS and not info.get("is_computed") and not is_nullable_type(info.get("type_")):
                 problems.append(f"column {name!r} is not nullable, and inserts never set it")
         primary_key = metadata.get("primary_key")
         if primary_key is not None:
@@ -380,7 +322,9 @@ class PixeltableMemoryStore:
             return None
         return rows[0]
 
-    def _lookup_operation(self, t: pxt.Table, operation: MemoryOperation) -> MemoryMutation | None:
+    def _lookup_operation(
+        self, t: pxt.Table, operation: MemoryOperation, *, withdraw_unapplied: bool = False
+    ) -> MemoryMutation | None:
         rows = (
             t.where(t.path == f"{_OP_PREFIX}{operation.id}")
             .select(t.fingerprint, t.version, t.existed, t.content)
@@ -398,13 +342,19 @@ class PixeltableMemoryStore:
         )
         if row["content"] is not None:
             # Prepared but not completed: the mutation may or may not have landed; settle it first.
-            self._recover_operation(t, operation, row["content"], mutation)
+            self._recover_operation(t, operation, row["content"], mutation, withdraw_unapplied)
         return mutation
 
     def _recover_operation(
-        self, t: pxt.Table, operation: MemoryOperation, intent: str, receipt: MemoryMutation
+        self, t: pxt.Table, operation: MemoryOperation, intent: str, receipt: MemoryMutation, withdraw: bool
     ) -> None:
-        """Roll a prepared operation forward or confirm it applied, then mark the receipt complete."""
+        """Roll a prepared operation forward or confirm it applied, then mark the receipt complete.
+
+        ``withdraw`` is for a writer whose own mutation just lost the compare-and-set: an intent
+        that did not land is deleted so a retry starts clean, as FileStore (which checks and
+        journals in one transaction) never keeps one. A crash-recovered intent that cannot be
+        settled stays, blocking recovery like FileStore.
+        """
         recorded = json.loads(intent)
         row = self._file_row(t, recorded["file"])
         current = None if row is None else str(row["version"])
@@ -420,6 +370,8 @@ class PixeltableMemoryStore:
             else:
                 applied = True
         if not applied:
+            if withdraw:
+                t.delete(where=(t.path == f"{_OP_PREFIX}{operation.id}") & (t.kind == _KIND_OP) & (t.content == intent))
             raise MemoryConflictError(f"memory path {recorded['file']!r} changed during operation {operation.id!r}")
         self._complete_operation(t, operation)
 
@@ -560,9 +512,9 @@ class PixeltableMemoryStore:
                     raise MemoryConflictError(f"memory path {path!r} changed before it could be written")
         except MemoryConflictError:
             if operation is not None:
-                # A peer that journaled the same operation id may have finished the mutation;
-                # adopt its receipt rather than let a retry apply it twice.
-                receipt = self._lookup_operation(t, operation)
+                # A peer sharing the operation id may have applied our intent; adopt it rather
+                # than let a retry apply it twice. Otherwise the intent is withdrawn.
+                receipt = self._lookup_operation(t, operation, withdraw_unapplied=True)
                 if receipt is not None:
                     return receipt
             raise
@@ -598,8 +550,8 @@ class PixeltableMemoryStore:
                     raise MemoryConflictError(f"memory path {path!r} changed before it could be deleted")
         except MemoryConflictError:
             if operation is not None:
-                # A peer that journaled the same operation id may have finished the mutation.
-                receipt = self._lookup_operation(t, operation)
+                # Same as in _write_sync: adopt a peer's receipt or withdraw ours.
+                receipt = self._lookup_operation(t, operation, withdraw_unapplied=True)
                 if receipt is not None:
                     return receipt
             raise
@@ -607,18 +559,17 @@ class PixeltableMemoryStore:
             self._complete_operation(t, operation)
         return MemoryMutation(version=None, replayed=False, existed=existed)
 
-    def _file_rows(self, t: pxt.Table, prefix: str, *, with_content: bool) -> list[dict[str, Any]]:
-        """Live file rows under ``prefix``, matched and sorted in Python.
+    def _file_rows(self, t: pxt.Table, prefix: str, content_chars: int = 0) -> list[dict[str, Any]]:
+        """Live file rows under ``prefix``, sorted by path, with ``content`` cut to ``content_chars`` when set.
 
-        A database-side ``startswith`` filter is not available (pixeltable types it as Int,
-        which ``where()`` rejects, and ``startswith(...) == 1`` emits a boolean-vs-bigint
-        comparison PostgreSQL rejects) and a ``[prefix, prefix+'\\uffff')`` range scan
-        depends on the database collation, so matching and ordering happen here.
+        The prefix match is a substring equality, which is collation-independent; a
+        ``[prefix, prefix+'\\uffff')`` range scan or an ORDER BY is not, so sorting happens here.
         """
-        cols = (t.path, t.content) if with_content else (t.path,)
-        rows = [
-            row for row in t.where(t.kind == _KIND_FILE).select(*cols).collect() if str(row["path"]).startswith(prefix)
-        ]
+        pred = t.kind == _KIND_FILE
+        if prefix:
+            pred = pred & (t.path.slice(0, len(prefix)) == prefix)
+        columns = {"content": t.content.slice(0, content_chars)} if content_chars else {}
+        rows = list(t.where(pred).select(t.path, **columns).collect())
         rows.sort(key=lambda row: str(row["path"]))
         return rows
 
@@ -627,7 +578,7 @@ class PixeltableMemoryStore:
         if limit <= 0:
             raise ValueError("limit must be positive")
         t = self._ensure_table()
-        return [str(row["path"]) for row in self._file_rows(t, prefix, with_content=False)[:limit]]
+        return [str(row["path"]) for row in self._file_rows(t, prefix)[:limit]]
 
     def _search_sync(
         self,
@@ -642,7 +593,8 @@ class PixeltableMemoryStore:
         if not query.split() or limit <= 0 or max_files <= 0 or max_chars <= 0 or max_file_chars <= 0:
             return MemorySearchResult(matches=[], scanned=0, truncated=False)
         t = self._ensure_table()
-        fetched = self._file_rows(t, prefix, with_content=True)
+        # One extra character tells a file cut at max_file_chars from one that fits exactly.
+        fetched = self._file_rows(t, prefix, content_chars=max_file_chars + 1)
         has_more = len(fetched) > max_files
         scanned_rows = fetched[:max_files]
         files = [(str(row["path"]), (row["content"] or "")[:max_file_chars]) for row in scanned_rows]

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import KW_ONLY, dataclass
-from typing import Any
 
 from pydantic_ai.capabilities import AbstractCapability
 from pydantic_ai.tools import AgentDepsT
@@ -46,10 +45,12 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
     ```
     """
 
-    _: KW_ONLY
-
     tables: list[str]
-    """Allowlist of table paths or directory prefixes. ``['*']`` is the whole catalog."""
+    """Allowlist of table paths or directory prefixes. ``['*']`` is the whole catalog.
+
+    The only positional argument, so the spec short form ``{"Pixeltable": ["my_app.doc_chunks"]}`` works."""
+
+    _: KW_ONLY
 
     max_rows: int = 20
     """Hard cap on rows returned by ``query_table`` and ``similarity_search``."""
@@ -72,7 +73,7 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
             raise ValueError(f"max_chars must be at least 1, got {self.max_chars}")
         if isinstance(self.tables, str):
             raise ValueError("tables must be a list of paths, not a string")
-        cleaned = [entry for entry in self.tables if entry]
+        cleaned = [entry.replace("/", ".") for entry in self.tables if entry]
         if not cleaned:
             raise ValueError("tables must be a non-empty allowlist, or ['*'] for the whole catalog")
         if ALL_TABLES in cleaned and cleaned != [ALL_TABLES]:
@@ -128,17 +129,3 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
             max_chars=self.max_chars,
             id=self.id or "pixeltable",
         )
-
-    @classmethod
-    def from_spec(cls, *args: Any, **kwargs: Any) -> Pixeltable[AgentDepsT]:
-        """Build from a YAML/dict spec; register with ``Agent.from_spec(custom_capability_types=[Pixeltable])``.
-
-        A bare ``{"Pixeltable": ["dir.tbl"]}`` spec entry passes the allowlist positionally.
-        """
-        if args:
-            if len(args) > 1 or "tables" in kwargs:
-                raise TypeError("Pixeltable spec accepts at most one positional argument: the tables allowlist")
-            kwargs["tables"] = args[0]
-        if isinstance(kwargs.get("tables"), str):
-            raise ValueError("tables must be a list of paths, not a string")
-        return cls(**kwargs)

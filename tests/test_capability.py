@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -183,6 +184,9 @@ def test_combine_intersects_allowlists_and_tightens_caps() -> None:
     covered = Pixeltable.combine([Pixeltable(tables=["d"]), Pixeltable(tables=["d.t1"])])
     assert covered.tables == ["d.t1"]
 
+    slashed = Pixeltable.combine([Pixeltable(tables=["d/t1"]), Pixeltable(tables=["d.t1.v"])])
+    assert slashed.tables == ["d.t1.v"]
+
     with pytest.raises(ValueError, match="share no allowed tables"):
         Pixeltable.combine([Pixeltable(tables=["a"]), Pixeltable(tables=["b"])])
 
@@ -298,6 +302,18 @@ def test_where_rejects_wrong_value_type(catalog: str) -> None:
     assert tools.query_table(f"{catalog}.chunks", where={"pos": 0})["rows"][0]["pos"] == 0
 
 
+def test_where_parses_iso_timestamp_date_and_uuid(catalog: str) -> None:
+    # JSON has no timestamp, date, or UUID; unparsed strings would silently match nothing.
+    key = uuid.uuid4()
+    typed = pxt.create_table(f"{catalog}.typed", {"ts": pxt.Timestamp, "d": pxt.Date, "id": pxt.UUID})
+    typed.insert([{"ts": datetime(2024, 1, 2, 3, 4, 5), "d": date(2024, 1, 2), "id": key}])
+    tools = Pixeltable(tables=[f"{catalog}.typed"]).get_toolset()
+    for where in ({"ts": "2024-01-02T03:04:05"}, {"d": "2024-01-02"}, {"id": str(key)}):
+        assert len(tools.query_table(f"{catalog}.typed", where=where)["rows"]) == 1
+    with pytest.raises(ModelRetry, match="ISO-format Timestamp"):
+        tools.query_table(f"{catalog}.typed", where={"ts": "yesterday"})
+
+
 def test_default_projection_skips_unstored_computed(catalog: str) -> None:
     # Unstored computed columns recompute at query time; an LLM UDF would spend money.
     chunks = pxt.get_table(f"{catalog}.chunks")
@@ -311,6 +327,11 @@ def test_default_projection_skips_unstored_computed(catalog: str) -> None:
     assert result["rows"][0]["materialized"] == 0
     named = _tools(catalog).query_table(f"{catalog}.chunks", columns=["text", "virtual"])
     assert named["rows"][0]["virtual"] == 0
+    stored = {c["name"]: c["is_stored"] for c in _tools(catalog).describe_table(f"{catalog}.chunks")["columns"]}
+    assert stored["virtual"] is False and stored["materialized"] is True
+    # A filter would run the column for every row (and crash pixeltable with an AssertionError).
+    with pytest.raises(ModelRetry, match="computed on read"):
+        _tools(catalog).query_table(f"{catalog}.chunks", where={"virtual": 0})
 
 
 def test_similarity_score_does_not_shadow_real_column(catalog: str) -> None:
@@ -337,3 +358,18 @@ def test_oversized_cell_is_truncated_not_dropped(catalog: str) -> None:
     assert result["rows"], "one oversized cell must not empty the result"
     assert result["truncated"]
     assert len(result["rows"][0]["text"]) < len(big)
+
+
+def test_moved_table_is_not_served_under_its_old_name(catalog: str) -> None:
+    tools = Pixeltable(tables=[f"{catalog}.other"]).get_toolset()
+    assert tools.query_table(f"{catalog}.other")["rows"]
+    pxt.move(f"{catalog}.other", f"{catalog}.moved")
+    with pytest.raises(ModelRetry, match="Cannot open table"):
+        tools.query_table(f"{catalog}.other")
+
+
+def test_version_handle_follows_its_table(catalog: str) -> None:
+    tools = Pixeltable(tables=[f"{catalog}.chunks"]).get_toolset()
+    assert tools.query_table(f"{catalog}.chunks:1", columns=["text"])["rows"]
+    with pytest.raises(ModelRetry, match="allowlist"):
+        tools.query_table(f"{catalog}.other:1")

@@ -21,6 +21,7 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check .
       - run: ruff format --check .
+      - run: mypy pydantic_ai_pixeltable
       - run: pytest tests/ -v
 
   build:
@@ -32,9 +33,11 @@ jobs:
         with:
           python-version: "3.12"
       - name: Check tag matches package version
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          test "v$version" = "${{ github.ref_name }}" || { echo "tag ${{ github.ref_name }} != version $version"; exit 1; }
+          test "v$version" = "$TAG" || { echo "tag $TAG != version $version"; exit 1; }
       - run: pip install build
       - run: python -m build
       - uses: actions/upload-artifact@v4

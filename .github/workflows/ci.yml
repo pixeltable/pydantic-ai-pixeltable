@@ -37,7 +37,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
       fail-fast: false
     steps:
       - uses: actions/checkout@v4
@@ -48,13 +48,13 @@ jobs:
       - run: pytest tests/ -v
 
   floor:
-    # Declared minimums: pixeltable 0.7.8, pydantic-ai-harness 0.29.0.
+    # Declared minimums: Python 3.11, pixeltable 0.7.8, pydantic-ai-harness 0.29.0, pydantic-ai-slim 2.38.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.11"
       - run: pip install -e ".[dev]" "pixeltable==0.7.8" "pydantic-ai-harness==0.29.0" "pydantic-ai-slim==2.38.0"
       - run: pytest tests/ -v
 
