@@ -9,7 +9,7 @@
 - `PixeltableMemoryStore`: persist Harness `Memory` in a Pixeltable table (same `Memory(store)` slot as `FileStore`)
 - `Pixeltable`: read-only catalog tools (`list_tables`, `describe_table`, `query_table`, `similarity_search`) over tables you already have
 
-Neither requires the other. Requires **Pixeltable >= 0.6.8** and **pydantic-ai-harness >= 0.29.0**.
+Neither requires the other. Requires **Pixeltable >= 0.7.8** and **pydantic-ai-harness >= 0.29.0**.
 
 This is an interoperability bridge. Native Pixeltable agents still use a `TableModel` and computed columns.
 

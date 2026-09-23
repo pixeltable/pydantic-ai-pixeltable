@@ -18,7 +18,7 @@ from pydantic_ai_harness.memory import (
 )
 
 from pydantic_ai_pixeltable import PixeltableMemoryStore
-from pydantic_ai_pixeltable.store import _insert_rows, _primary_key_type
+from pydantic_ai_pixeltable.store import _insert_rows
 
 
 @pytest.fixture()
@@ -255,12 +255,12 @@ def test_incompatible_existing_table_rejected() -> None:
         "fingerprint": pxt.String | None,
         "existed": pxt.Bool | None,
     }
-    pk_columns = {**memory_columns, "path": _primary_key_type()}
+    pk_columns = {**memory_columns, "path": pxt.String}
     try:
         # Pre-release revisions used an Int version column.
         pxt.create_table(
             name,
-            {"path": _primary_key_type(), "version": pxt.Int | None},
+            {"path": pxt.String, "version": pxt.Int | None},
             primary_key="path",
         )
         with pytest.raises(ValueError, match="not a memory table"):
@@ -276,7 +276,7 @@ def test_incompatible_existing_table_rejected() -> None:
         # Missing bookkeeping columns.
         pxt.create_table(
             name,
-            {"path": _primary_key_type(), "kind": pxt.String},
+            {"path": pxt.String, "kind": pxt.String},
             primary_key="path",
         )
         with pytest.raises(ValueError, match="column 'content' is missing"):
@@ -286,7 +286,7 @@ def test_incompatible_existing_table_rejected() -> None:
         # `__op__` receipts write None to `content`, so a non-nullable column rejects them.
         pxt.create_table(
             name,
-            {**pk_columns, "content": _primary_key_type()},
+            {**pk_columns, "content": pxt.String},
             primary_key="path",
         )
         with pytest.raises(ValueError, match="not nullable"):
@@ -296,7 +296,7 @@ def test_incompatible_existing_table_rejected() -> None:
         # Inserts never set an extra column, so a non-nullable one rejects them.
         pxt.create_table(
             name,
-            {**pk_columns, "extra": _primary_key_type()},
+            {**pk_columns, "extra": pxt.String},
             primary_key="path",
         )
         with pytest.raises(ValueError, match="inserts never set"):
@@ -345,7 +345,7 @@ def test_existing_memory_table_is_reused() -> None:
         pxt.create_table(
             name,
             {
-                "path": _primary_key_type(),
+                "path": pxt.String,
                 "kind": pxt.String,
                 "content": pxt.String | None,
                 "version": pxt.String | None,

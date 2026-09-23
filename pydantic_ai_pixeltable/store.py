@@ -36,7 +36,7 @@ def _reject_reserved_path(path: str) -> None:
 
 
 # The primary-key index covers left(path, 256): two longer paths whose first 256 characters
-# match collide on insert, and 0.6.x rejects them outright. Cap paths below the boundary.
+# match collide on insert. Cap paths below the boundary.
 _MAX_PATH_CHARS = 255
 
 
@@ -154,23 +154,10 @@ _NULLABLE_COLUMNS = frozenset({"content", "version", "last_operation_id", "finge
 _PATH_INDEX = "path_lookup_idx"
 
 
-def _primary_key_type() -> Any:
-    # Where bare types are non-nullable (newer pixeltable) Required[] is deprecated;
-    # where they are nullable (0.6.x, 0.7.1) a nullable primary key is rejected.
-    # The boundary is not a clean version number, so probe the resolved behavior.
-    try:
-        import pixeltable.type_system as ts
-
-        if not ts.ColumnType.from_python_type(pxt.String).nullable:
-            return pxt.String
-    except (AttributeError, ImportError, TypeError):
-        pass
-    return pxt.Required[pxt.String]
-
-
 def _memory_schema() -> dict[str, Any]:
     return {
-        "path": _primary_key_type(),
+        # Bare types are non-nullable; `T | None` declares a nullable column.
+        "path": pxt.String,
         "kind": pxt.String,
         "content": pxt.String | None,
         "version": pxt.String | None,
@@ -333,12 +320,11 @@ class PixeltableMemoryStore:
         return t
 
     def _add_path_index(self, t: pxt.Table) -> None:
-        # Absent on pixeltable 0.6.x; reads still work without it, just slower.
-        if hasattr(t, "add_btree_index"):
-            try:
-                t.add_btree_index("path", idx_name=_PATH_INDEX, if_exists="ignore")
-            except pxt.Error:
-                pass
+        # The primary key indexes left(path, 256); a btree serves exact-path lookups.
+        try:
+            t.add_btree_index("path", idx_name=_PATH_INDEX, if_exists="ignore")
+        except pxt.Error:
+            pass  # an optimization only; the store still works without it
 
     def _check_compatible_schema(self, t: pxt.Table) -> None:
         """Reject a pre-existing table whose schema cannot back the MemoryStore protocol."""
@@ -349,8 +335,8 @@ class PixeltableMemoryStore:
                 f"{self._table_name!r} is a {kind or 'non-table object'}; the memory store needs a writable table"
             )
         columns = metadata.get("columns") or {}
-        # 'Required[' appears only in 0.6.x's schema-style type_ rendering; seeing it means a
-        # bare 'T' marks a nullable column rather than a non-nullable one.
+        # 'Required[' appears only in old pixeltable's schema-style type_ rendering; seeing it
+        # means a bare 'T' marks a nullable column rather than a non-nullable one.
         legacy_schema = any(str(info.get("type_")).startswith("Required[") for info in columns.values())
         problems: list[str] = []
         for name, expected in _SCHEMA_COLUMNS.items():
