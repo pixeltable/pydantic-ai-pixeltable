@@ -155,15 +155,17 @@ _PATH_INDEX = "path_lookup_idx"
 
 
 def _primary_key_type() -> Any:
-    # 0.7+ bare types are non-nullable by default and Required[] is deprecated;
-    # 0.6.x bare types are nullable by default and a nullable primary key is rejected.
+    # Where bare types are non-nullable (newer pixeltable) Required[] is deprecated;
+    # where they are nullable (0.6.x, 0.7.1) a nullable primary key is rejected.
+    # The boundary is not a clean version number, so probe the resolved behavior.
     try:
-        major_minor = tuple(int(part) for part in str(pxt.__version__).split(".")[:2])
-    except (AttributeError, ValueError):
-        major_minor = (0, 7)
-    if major_minor < (0, 7):
-        return pxt.Required[pxt.String]
-    return pxt.String
+        import pixeltable.type_system as ts
+
+        if not ts.ColumnType.from_python_type(pxt.String).nullable:
+            return pxt.String
+    except (AttributeError, ImportError, TypeError):
+        pass
+    return pxt.Required[pxt.String]
 
 
 def _memory_schema() -> dict[str, Any]:
