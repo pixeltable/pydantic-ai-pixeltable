@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -379,6 +380,115 @@ def test_create_path_still_validates(monkeypatch: pytest.MonkeyPatch) -> None:
             _ = PixeltableMemoryStore(table_name=name).table
     finally:
         pxt.drop_table(name, force=True)
+
+
+def _prepared_receipt(t: pxt.Table, operation: MemoryOperation, intent: dict[str, Any], **cols: Any) -> None:
+    """Insert a journaled receipt in the prepared state, as a crashed writer would leave it."""
+    _insert_rows(
+        t,
+        [
+            {
+                "path": f"__op__/{operation.id}",
+                "kind": "op",
+                "content": json.dumps(intent),
+                "version": cols.get("version"),
+                "last_operation_id": None,
+                "fingerprint": operation.fingerprint,
+                "existed": cols.get("existed", False),
+            }
+        ],
+    )
+
+
+async def test_prepared_receipt_rolls_forward(store: PixeltableMemoryStore) -> None:
+    # Crash shape: the journaled intent exists but the file mutation never landed.
+    operation = MemoryOperation(id="run-1:call-9", fingerprint="write:notes/a.md:hello")
+    _prepared_receipt(
+        store.table,
+        operation,
+        {"file": "notes/a.md", "op": "write", "expected": None, "new": "hello"},
+        version="result-v1",
+    )
+    replay = await store.get_operation(operation)
+    assert replay is not None
+    assert replay.replayed
+    assert replay.version == "result-v1"
+    file = await store.read("notes/a.md", max_chars=100)
+    assert file is not None
+    assert file.content == "hello"
+    assert file.version == "result-v1"
+    # The receipt is now completed; a second lookup is a plain replay.
+    assert await store.get_operation(operation) == replay
+
+
+async def test_prepared_receipt_after_apply_does_not_double_write(store: PixeltableMemoryStore) -> None:
+    # Crash shape: the file mutation landed but the receipt never completed.
+    operation = MemoryOperation(id="run-1:call-10", fingerprint="write:b.md:one")
+    first = await store.write("b.md", "one", expected_version=None, operation=operation)
+    t = store.table
+    t.update(
+        {"content": json.dumps({"file": "b.md", "op": "write", "expected": None, "new": "one"})},
+        where=t.path == f"__op__/{operation.id}",
+    )
+    replay = await store.write("b.md", "one", expected_version=None, operation=operation)
+    assert replay.replayed
+    assert replay.version == first.version
+    file = await store.read("b.md", max_chars=100)
+    assert file is not None
+    assert file.content == "one"
+
+
+async def test_prepared_receipt_conflicts_when_path_moved(store: PixeltableMemoryStore) -> None:
+    # The journaled expectation is stale: the path changed after the receipt was written.
+    await store.write("c.md", "v1", expected_version=None)
+    operation = MemoryOperation(id="run-1:call-11", fingerprint="write:c.md:x")
+    _prepared_receipt(
+        store.table,
+        operation,
+        {"file": "c.md", "op": "write", "expected": None, "new": "x"},
+        version="result-x",
+    )
+    with pytest.raises(MemoryConflictError):
+        await store.write("c.md", "x", expected_version=None, operation=operation)
+
+
+async def test_prepared_delete_rolls_forward(store: PixeltableMemoryStore) -> None:
+    created = await store.write("d.md", "x", expected_version=None)
+    operation = MemoryOperation(id="run-1:call-12", fingerprint="delete:d.md")
+    _prepared_receipt(
+        store.table,
+        operation,
+        {"file": "d.md", "op": "delete", "expected": created.version, "new": None},
+        version=None,
+        existed=True,
+    )
+    result = await store.delete("d.md", expected_version=created.version, operation=operation)
+    assert result.replayed
+    assert result.existed
+    assert await store.read("d.md", max_chars=10) is None
+
+
+async def test_compact_preserves_live_state(store: PixeltableMemoryStore) -> None:
+    operation = MemoryOperation(id="run-1:call-13", fingerprint="write:keep.md:a")
+    created = await store.write("keep.md", "a", expected_version=None, operation=operation)
+    gone = await store.write("gone.md", "x", expected_version=None)
+    assert gone.version is not None
+    await store.delete("gone.md", expected_version=gone.version)
+    updated = await store.write("keep.md", "b", expected_version=created.version)
+
+    store.compact()
+
+    file = await store.read("keep.md", max_chars=100)
+    assert file is not None
+    assert file.content == "b"
+    assert file.version == updated.version
+    assert await store.list_paths("", limit=50) == ["keep.md"]
+    replay = await store.get_operation(operation)
+    assert replay is not None
+    assert replay.replayed
+    assert replay.version == created.version
+    await store.write("new.md", "n", expected_version=None)
+    assert await store.list_paths("", limit=50) == ["keep.md", "new.md"]
 
 
 def test_column_base_covers_both_type_renderings() -> None:

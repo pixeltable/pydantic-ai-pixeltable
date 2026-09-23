@@ -13,6 +13,24 @@ Neither requires the other. Requires **Pixeltable >= 0.6.8** and **pydantic-ai-h
 
 This is an interoperability bridge. Native Pixeltable agents still use a `TableModel` and computed columns.
 
+## How it fits together
+
+```text
+Native backend (FileStore)                 This package (Pixeltable)
+
+Memory(FileStore)                          Memory(PixeltableMemoryStore)
+  └ .agent-memory/                           └ pxt table 'harness.memory'
+      ├ main/MEMORY.md                           ├ kind='file' rows  path, content, version
+      ├ ... (one .md per memory path)            └ kind='op' rows    '__op__/<id>' receipts
+      └ .memory-store.sqlite3                  same catalog as your data; inspect via store.table
+          (versions + operation journal)
+                                           Pixeltable(tables=[...])  (optional, independent)
+                                             └ your existing tables/views, incl. pxt.Document and
+                                               embedding indexes -> query_table, similarity_search
+```
+
+Unique to this backend: memory rows are ordinary catalog rows. Add an embedding index on `content` for semantic recall, or query them like any other table.
+
 ## Installation
 
 ```bash
@@ -110,7 +128,8 @@ Without `custom_capability_types=[Pixeltable]`, `Agent.from_spec` does not know 
 - The table is created on first use; you do not run `pxt schema update` for it.
 - Each path is one row (`kind == "file"`); operation receipts are rows under `__op__/`. Path roots `__meta__` and `__op__` are reserved.
 - Compare-and-set: `expected_version` must equal the row's version. Versions are unique UUID strings, not monotonic. A stale version raises `MemoryConflictError`.
-- Receipts are a second write after the file mutation, not one SQL transaction. A crash between them can raise `MemoryConflictError` on replay instead of `replayed=True`.
+- Operation receipts are journaled `__op__` rows: the intended mutation is recorded before it is applied, so a mid-write crash rolls forward or replays cleanly instead of double-applying.
+- `store.compact()` rebuilds the table from live rows. Pixeltable keeps old row versions for updates and deletes, so compaction is the only way to reclaim storage. Run it with writers paused.
 - `Memory(PixeltableMemoryStore)` is Python-only. Harness YAML backends are `memory`, `file`, and `sqlite`.
 
 ### Escape hatch: `.table`
