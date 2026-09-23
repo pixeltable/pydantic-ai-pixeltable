@@ -573,3 +573,46 @@ async def test_conflicted_mutation_withdraws_prepared_receipt(
         retried = await store.delete("q.md", expected_version=current.version, operation=operation)
         assert not retried.replayed
         assert await store.read("q.md", max_chars=100) is None
+
+
+@pytest.mark.parametrize("mutation", ["write", "delete"])
+async def test_withdraw_never_drops_an_intent_a_peer_applied(
+    store: PixeltableMemoryStore, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    # A peer replaying our operation id applies the intent but has not completed it, then an
+    # unrelated writer lands on top. Our CAS fails and the file no longer shows our version,
+    # yet the intent did land: the peer's claim must stop the withdraw, or a retry applies it twice.
+    base = await store.write("w.md", "base\n", expected_version=None)
+    operation = MemoryOperation(id=f"run-1:call-30-{mutation}", fingerprint=f"{mutation}:w.md")
+    peer = PixeltableMemoryStore(table_name=store._table_name)
+    other = PixeltableMemoryStore(table_name=store._table_name)
+    deferred: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(peer, "_complete_operation", lambda *call: deferred.append(call))
+    original = PixeltableMemoryStore._prepare_operation
+
+    def prepare(self: PixeltableMemoryStore, t: pxt.Table, op: MemoryOperation, *args: Any) -> Any:
+        receipt = original(self, t, op, *args)
+        if receipt is None and self is store:
+            assert peer._get_operation_sync(op) is not None  # peer rolls our intent forward
+            current = other._read_sync("w.md", 100)
+            if mutation == "write":
+                other._write_sync("w.md", "other\n", None if current is None else current.version, None)
+            else:
+                other._write_sync("w.md", "recreated\n", None, None)
+        return receipt
+
+    monkeypatch.setattr(PixeltableMemoryStore, "_prepare_operation", prepare)
+    with pytest.raises(MemoryConflictError):
+        if mutation == "write":
+            await store.write("w.md", "base\nfact\n", expected_version=base.version, operation=operation)
+        else:
+            await store.delete("w.md", expected_version=base.version, operation=operation)
+    monkeypatch.setattr(PixeltableMemoryStore, "_prepare_operation", original)
+    for call in deferred:
+        PixeltableMemoryStore._complete_operation(peer, *call)
+
+    replay = await store.get_operation(operation)
+    assert replay is not None and replay.replayed  # the retry replays; it does not re-apply
+    current = await store.read("w.md", max_chars=100)
+    assert current is not None
+    assert current.content == ("other\n" if mutation == "write" else "recreated\n")

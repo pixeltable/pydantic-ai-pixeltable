@@ -26,6 +26,8 @@ from pydantic_ai_pixeltable._types import column_base, is_nullable_type
 _KIND_FILE = "file"
 _KIND_OP = "op"
 _OP_PREFIX = "__op__/"
+# Set in a receipt row's (otherwise unused) last_operation_id by whoever rolls its intent forward.
+_CLAIMED = "claimed"
 # __op__ receipts are written today; __meta__ stays reserved for future bookkeeping.
 _RESERVED_ROOTS = frozenset({"__meta__", "__op__"})
 
@@ -342,24 +344,32 @@ class PixeltableMemoryStore:
         )
         if row["content"] is not None:
             # Prepared but not completed: the mutation may or may not have landed; settle it first.
-            self._recover_operation(t, operation, row["content"], mutation, withdraw_unapplied)
+            if not self._recover_operation(t, operation, row["content"], mutation, withdraw_unapplied):
+                # The intent was withdrawn or replaced before we could claim it; look again.
+                return self._lookup_operation(t, operation)
         return mutation
 
     def _recover_operation(
         self, t: pxt.Table, operation: MemoryOperation, intent: str, receipt: MemoryMutation, withdraw: bool
-    ) -> None:
+    ) -> bool:
         """Roll a prepared operation forward or confirm it applied, then mark the receipt complete.
 
-        ``withdraw`` is for a writer whose own mutation just lost the compare-and-set: an intent
-        that did not land is deleted so a retry starts clean, as FileStore (which checks and
-        journals in one transaction) never keeps one. A crash-recovered intent that cannot be
-        settled stays, blocking recovery like FileStore.
+        ``withdraw`` is for the writer whose own mutation just lost the compare-and-set: an
+        intent nobody claimed cannot have landed, so it is deleted and a retry starts clean, as
+        FileStore (which checks and journals in one transaction) never keeps one. A peer claims
+        the receipt before rolling it forward, and a claimed or crash-recovered intent that
+        cannot be settled stays, blocking recovery like FileStore. Returns False when the intent
+        was gone before it could be claimed.
         """
+        receipt_row = (t.path == f"{_OP_PREFIX}{operation.id}") & (t.kind == _KIND_OP) & (t.content == intent)
         recorded = json.loads(intent)
         row = self._file_row(t, recorded["file"])
         current = None if row is None else str(row["version"])
         applied = current is None if recorded["op"] == "delete" else current == receipt.version
         if not applied and current == recorded["expected"]:
+            # Claim first: a writer withdrawing this intent deletes it only while unclaimed.
+            if t.update({"last_operation_id": _CLAIMED}, where=receipt_row).row_count_stats.upd_rows != 1:
+                return False
             try:
                 self._apply_intent(t, operation, recorded, receipt)
             except MemoryConflictError:
@@ -371,9 +381,10 @@ class PixeltableMemoryStore:
                 applied = True
         if not applied:
             if withdraw:
-                t.delete(where=(t.path == f"{_OP_PREFIX}{operation.id}") & (t.kind == _KIND_OP) & (t.content == intent))
+                t.delete(where=receipt_row & (t.last_operation_id == None))  # noqa: E711 (SQL IS NULL)
             raise MemoryConflictError(f"memory path {recorded['file']!r} changed during operation {operation.id!r}")
-        self._complete_operation(t, operation)
+        self._complete_operation(t, operation, intent)
+        return True
 
     def _apply_intent(
         self, t: pxt.Table, operation: MemoryOperation, recorded: dict[str, Any], receipt: MemoryMutation
@@ -411,10 +422,7 @@ class PixeltableMemoryStore:
         self,
         t: pxt.Table,
         operation: MemoryOperation,
-        file: str,
-        op: str,
-        expected: str | None,
-        new: str | None,
+        intent: str,
         version: str | None,
         existed: bool,
     ) -> MemoryMutation | None:
@@ -426,7 +434,7 @@ class PixeltableMemoryStore:
                     {
                         "path": f"{_OP_PREFIX}{operation.id}",
                         "kind": _KIND_OP,
-                        "content": _op_intent(file, op, expected, new),
+                        "content": intent,
                         "version": version,
                         "last_operation_id": None,
                         "fingerprint": operation.fingerprint,
@@ -442,9 +450,15 @@ class PixeltableMemoryStore:
             return receipt
         return None
 
-    def _complete_operation(self, t: pxt.Table, operation: MemoryOperation) -> None:
-        """Drop the journaled intent; the mutation is durable, so the payload is no longer needed."""
-        t.update({"content": None}, where=(t.path == f"{_OP_PREFIX}{operation.id}") & (t.kind == _KIND_OP))
+    def _complete_operation(self, t: pxt.Table, operation: MemoryOperation, intent: str) -> None:
+        """Drop the journaled intent; the mutation is durable, so the payload is no longer needed.
+
+        Matching on ``intent`` keeps a late peer from completing a newer intent under the same id.
+        """
+        t.update(
+            {"content": None},
+            where=(t.path == f"{_OP_PREFIX}{operation.id}") & (t.kind == _KIND_OP) & (t.content == intent),
+        )
 
     def _read_sync(self, path: str, max_chars: int) -> MemoryFile | None:
         _check_store_path(path)
@@ -483,8 +497,9 @@ class PixeltableMemoryStore:
             raise MemoryConflictError(f"memory path {path!r} changed before it could be written")
         version = uuid.uuid4().hex
         existed = row is not None
+        intent = _op_intent(path, "write", expected_version, content)
         if operation is not None:
-            receipt = self._prepare_operation(t, operation, path, "write", expected_version, content, version, existed)
+            receipt = self._prepare_operation(t, operation, intent, version, existed)
             if receipt is not None:
                 return receipt
         try:
@@ -519,7 +534,7 @@ class PixeltableMemoryStore:
                     return receipt
             raise
         if operation is not None:
-            self._complete_operation(t, operation)
+            self._complete_operation(t, operation, intent)
         return MemoryMutation(version=version, replayed=False, existed=existed)
 
     def _delete_sync(
@@ -539,8 +554,9 @@ class PixeltableMemoryStore:
         if current != expected_version:
             raise MemoryConflictError(f"memory path {path!r} changed before it could be deleted")
         existed = row is not None
+        intent = _op_intent(path, "delete", expected_version, None)
         if operation is not None:
-            receipt = self._prepare_operation(t, operation, path, "delete", expected_version, None, None, existed)
+            receipt = self._prepare_operation(t, operation, intent, None, existed)
             if receipt is not None:
                 return receipt
         try:
@@ -556,7 +572,7 @@ class PixeltableMemoryStore:
                     return receipt
             raise
         if operation is not None:
-            self._complete_operation(t, operation)
+            self._complete_operation(t, operation, intent)
         return MemoryMutation(version=None, replayed=False, existed=existed)
 
     def _file_rows(self, t: pxt.Table, prefix: str, content_chars: int = 0) -> list[dict[str, Any]]:
@@ -595,15 +611,17 @@ class PixeltableMemoryStore:
         t = self._ensure_table()
         # One extra character tells a file cut at max_file_chars from one that fits exactly.
         fetched = self._file_rows(t, prefix, content_chars=max_file_chars + 1)
-        has_more = len(fetched) > max_files
-        scanned_rows = fetched[:max_files]
-        files = [(str(row["path"]), (row["content"] or "")[:max_file_chars]) for row in scanned_rows]
-        content_truncated = any(len(row["content"] or "") > max_file_chars for row in scanned_rows)
+        # One file past max_files lets _lexical_search report the scan bound as truncated.
+        files = [(str(row["path"]), row["content"] or "") for row in fetched[: max_files + 1]]
         result = _lexical_search(
-            files, query, limit=limit, max_files=max_files, max_chars=max_chars, score_prefix=prefix
+            [(path, content[:max_file_chars]) for path, content in files],
+            query,
+            limit=limit,
+            max_files=max_files,
+            max_chars=max_chars,
+            score_prefix=prefix,
         )
+        content_truncated = any(len(content) > max_file_chars for _, content in files[:max_files])
         return MemorySearchResult(
-            matches=result.matches,
-            scanned=result.scanned,
-            truncated=result.truncated or content_truncated or has_more,
+            matches=result.matches, scanned=result.scanned, truncated=result.truncated or content_truncated
         )

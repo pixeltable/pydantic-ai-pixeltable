@@ -368,8 +368,9 @@ def test_moved_table_is_not_served_under_its_old_name(catalog: str) -> None:
         tools.query_table(f"{catalog}.other")
 
 
-def test_version_handle_follows_its_table(catalog: str) -> None:
-    tools = Pixeltable(tables=[f"{catalog}.chunks"]).get_toolset()
-    assert tools.query_table(f"{catalog}.chunks:1", columns=["text"])["rows"]
-    with pytest.raises(ModelRetry, match="allowlist"):
-        tools.query_table(f"{catalog}.other:1")
+def test_version_handles_are_refused(catalog: str) -> None:
+    # An old version still holds rows deleted and columns dropped since (e.g. for privacy).
+    for tables in ([f"{catalog}.chunks"], [catalog], ["*"]):
+        tools = Pixeltable(tables=tables).get_toolset()
+        with pytest.raises(ModelRetry, match="allowlist"):
+            tools.query_table(f"{catalog}.chunks:1", columns=["text"])

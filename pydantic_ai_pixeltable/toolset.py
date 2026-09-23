@@ -61,10 +61,12 @@ def _norm(path: str) -> str:
 
 
 def _allowed(path: str, tables: list[str]) -> bool:
+    # A version handle ('tbl:3') reads rows and columns since deleted or dropped; refuse it.
+    if ":" in path:
+        return False
     if tables == [ALL_TABLES]:
         return True
-    # A version handle ('tbl:3') is allowed exactly when its table is.
-    npath = _norm(path).split(":", 1)[0]
+    npath = _norm(path)
     return any(npath == _norm(entry) or npath.startswith(f"{_norm(entry)}.") for entry in tables)
 
 
@@ -103,11 +105,12 @@ def _row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _clip(value: Any, budget: int) -> Any:
-    """``value`` if its JSON fits in ``budget`` characters, else a cut string of it ending in ``...``."""
-    encoded = json.dumps(value, ensure_ascii=False)
-    if len(encoded) <= budget:
+    """``value`` if its JSON fits in ``budget`` characters; else a string cut to end in ``...``, or None."""
+    if len(json.dumps(value, ensure_ascii=False)) <= budget:
         return value
-    text = value if isinstance(value, str) else encoded
+    if not isinstance(value, str):
+        return None  # a cut dict or number would read as real data; `truncated` flags the gap
+    text = value
     keep = budget - 5  # quotes plus '...'
     # Escapes make the JSON longer than the text; shrink in proportion until it fits.
     while keep > 0 and (size := len(json.dumps(text[:keep], ensure_ascii=False))) + 3 > budget:

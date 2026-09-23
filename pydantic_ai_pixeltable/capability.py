@@ -39,7 +39,7 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
     from pydantic_ai_pixeltable import Pixeltable
 
     agent = Agent(
-        "anthropic:claude-sonnet-4-6",
+        "openai:gpt-5.6-sol",
         capabilities=[Pixeltable(tables=["my_app.doc_chunks"])],
     )
     ```

@@ -9,7 +9,7 @@ Give a [Pydantic AI](https://ai.pydantic.dev/) agent read access to your [Pixelt
 - `Pixeltable`: read-only tools `list_tables`, `describe_table`, `query_table`, and `similarity_search` over tables and views you already have.
 - `PixeltableMemoryStore`: a Harness `MemoryStore`, used as `Memory(store)` in place of `FileStore`.
 
-Each works without the other. Requires Python 3.11+, Pixeltable 0.7.8+, and pydantic-ai-harness 0.29.0+.
+Each works without the other. Requires Python 3.11+, pydantic-ai-slim 2.38+, pydantic-ai-harness 0.29.0+, and Pixeltable 0.7.8+.
 
 ## Quick start
 
@@ -39,16 +39,16 @@ print(agent.run_sync("Can I expense a 75 EUR dinner? Remember that I travel mont
 # The answer cites the 60 EUR daily limit; the note lands in the memory table.
 ```
 
-[`quickstart.py`](quickstart.py) is the full runnable version: a two-run HR assistant whose second run answers from what the first one remembered. In an app, declare the table on a `TableModel` and create it with `pxt schema update`.
+[`quickstart.py`](https://github.com/pixeltable/pydantic-ai-pixeltable/blob/main/quickstart.py) is the full runnable version: a two-run HR assistant whose second run answers from what the first one remembered. In an app, declare the table on a `TableModel` and create it with `pxt schema update`.
 
 ## Catalog tools
 
-- `tables` is a required allowlist of table paths or directory prefixes. `["*"]` allows the whole catalog, including a memory table. Version handles (`tbl:3`) follow their table.
+- `tables` is a required allowlist of table paths or directory prefixes. `["*"]` allows the whole catalog, including a memory table. A view inside an allowed directory exposes its base table's columns. Version handles (`tbl:3`) are refused, since old versions keep deleted rows and dropped columns.
 - `similarity_search` needs an embedding index on the column. `query_table` filters by equality only; timestamp, date, and UUID values are ISO strings.
 - Default columns skip media, array, binary, and unstored computed columns, which recompute on every read (possibly a model call) and also reject filters. A named media column returns a file URL.
-- `max_rows` (20) and `max_chars` (8000) bound every result. An oversized value is cut and ends in `...`; the `{"table", "rows", "truncated"}` envelope is always returned.
+- `max_rows` (20) and `max_chars` (8000) bound every result. An oversized string is cut to end in `...` and any other oversized value becomes `null`; the `{"table", "rows", "truncated"}` envelope is always returned.
 - Two instances on one agent share `id="pixeltable"` and merge by intersecting their allowlists; a disjoint merge raises. A capability passed to a single run replaces the agent's, so it can widen access.
-- [`pydantic-ai-chdb`](https://ai.pydantic.dev/capabilities/third-party/) registers the same `list_tables` and `describe_table` names; wrap one in [`PrefixTools`](https://ai.pydantic.dev/capabilities/prefix-tools/) to use both.
+- [`pydantic-ai-chdb`](https://github.com/chdb-io/pydantic-ai-chdb) registers the same `list_tables` and `describe_table` names; wrap one in [`PrefixTools`](https://ai.pydantic.dev/capabilities/prefix-tools/) to use both.
 - From a spec: `Agent.from_spec({"model": ..., "capabilities": [{"Pixeltable": ["handbook"]}]}, custom_capability_types=[Pixeltable])`.
 
 ## Memory store
