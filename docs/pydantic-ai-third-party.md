@@ -1,0 +1,6 @@
+<!--
+Entry for pydantic-ai's docs/capabilities/third-party.md, section "## Retrieval & RAG {#retrieval-rag}",
+after the haiku.rag bullet. Uses that page's mkdocs cross-reference syntax, so paste it as is.
+-->
+
+* [`pydantic-ai-pixeltable`](https://github.com/pixeltable/pydantic-ai-pixeltable) - Retrieval over existing [Pixeltable](https://pixeltable.com/) tables and views, including document chunks and the embedding indexes Pixeltable keeps current as rows change. `Pixeltable` registers read-only `list_tables`, `describe_table`, `query_table` (equality filters), and `similarity_search` tools over a required allowlist of tables or directories, with row- and character-bounded results; catalog errors are mapped to [`ModelRetry`][pydantic_ai.exceptions.ModelRetry] so the model can correct its call. Two instances on one agent merge by intersecting their allowlists. Works with [agent specs](../agent-spec.md), e.g. `{"Pixeltable": ["my_app.doc_chunks"]}` with `custom_capability_types=[Pixeltable]`. The package also ships `PixeltableMemoryStore`, a [Pydantic AI Harness](https://github.com/pydantic/pydantic-ai-harness) `MemoryStore` that keeps `Memory` notes as rows in the same catalog, with compare-and-set writes and journaled operation receipts. Also available as a lower-level [toolset](../toolsets.md) via `PixeltableToolset`.
