@@ -4,6 +4,8 @@ on:
   release:
     types: [published]
 
+permissions: {}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -29,6 +31,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Check tag matches package version
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          test "v$version" = "${{ github.ref_name }}" || { echo "tag ${{ github.ref_name }} != version $version"; exit 1; }
       - run: pip install build
       - run: python -m build
       - uses: actions/upload-artifact@v4

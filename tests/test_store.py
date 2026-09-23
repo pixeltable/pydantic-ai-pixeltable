@@ -18,7 +18,7 @@ from pydantic_ai_harness.memory import (
 )
 
 from pydantic_ai_pixeltable import PixeltableMemoryStore
-from pydantic_ai_pixeltable.store import _insert_rows
+from pydantic_ai_pixeltable.store import _insert_rows, _primary_key_type
 
 
 @pytest.fixture()
@@ -255,12 +255,12 @@ def test_incompatible_existing_table_rejected() -> None:
         "fingerprint": pxt.String | None,
         "existed": pxt.Bool | None,
     }
-    pk_columns = {**memory_columns, "path": pxt.Required[pxt.String]}
+    pk_columns = {**memory_columns, "path": _primary_key_type()}
     try:
         # Pre-release revisions used an Int version column.
         pxt.create_table(
             name,
-            {"path": pxt.Required[pxt.String], "version": pxt.Int | None},
+            {"path": _primary_key_type(), "version": pxt.Int | None},
             primary_key="path",
         )
         with pytest.raises(ValueError, match="not a memory table"):
@@ -276,7 +276,7 @@ def test_incompatible_existing_table_rejected() -> None:
         # Missing bookkeeping columns.
         pxt.create_table(
             name,
-            {"path": pxt.Required[pxt.String], "kind": pxt.String},
+            {"path": _primary_key_type(), "kind": pxt.String},
             primary_key="path",
         )
         with pytest.raises(ValueError, match="column 'content' is missing"):
@@ -286,7 +286,7 @@ def test_incompatible_existing_table_rejected() -> None:
         # `__op__` receipts write None to `content`, so a non-nullable column rejects them.
         pxt.create_table(
             name,
-            {**pk_columns, "content": pxt.Required[pxt.String]},
+            {**pk_columns, "content": _primary_key_type()},
             primary_key="path",
         )
         with pytest.raises(ValueError, match="not nullable"):
@@ -296,7 +296,7 @@ def test_incompatible_existing_table_rejected() -> None:
         # Inserts never set an extra column, so a non-nullable one rejects them.
         pxt.create_table(
             name,
-            {**pk_columns, "extra": pxt.Required[pxt.String]},
+            {**pk_columns, "extra": _primary_key_type()},
             primary_key="path",
         )
         with pytest.raises(ValueError, match="inserts never set"):
@@ -345,7 +345,7 @@ def test_existing_memory_table_is_reused() -> None:
         pxt.create_table(
             name,
             {
-                "path": pxt.Required[pxt.String],
+                "path": _primary_key_type(),
                 "kind": pxt.String,
                 "content": pxt.String | None,
                 "version": pxt.String | None,
@@ -521,3 +521,88 @@ def test_vendored_helpers_match_harness() -> None:
     ours = _lexical_search(files, "alpha", limit=10, max_files=10, max_chars=1_000)
     theirs = lexical_search(files, "alpha", limit=10, max_files=10, max_chars=1_000)
     assert ours == theirs
+
+
+async def test_rejects_paths_over_prefix_index_limit(store: PixeltableMemoryStore) -> None:
+    # The primary-key index covers left(path, 256): longer paths collide once their
+    # first 256 characters match, so the store refuses them outright.
+    # Segments stay within the 200-char limit; only the total path length trips the cap.
+    long_path = f"{'a' * 200}/{'b' * 200}"
+    with pytest.raises(ValueError, match="255"):
+        await store.write(long_path, "x", expected_version=None)
+    with pytest.raises(ValueError, match="255"):
+        await store.read(long_path, max_chars=10)
+    with pytest.raises(ValueError, match="255"):
+        await store.delete(long_path, expected_version=None)
+
+
+async def test_conflicted_mutation_adopts_peer_receipt(
+    store: PixeltableMemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Race: we journal the intent, a peer sharing the operation id applies and completes
+    # it, then our own mutation hits the CAS conflict. We must adopt the peer's receipt
+    # rather than retry into a double-apply.
+    operation = MemoryOperation(id="run-1:call-20", fingerprint="write:p.md:c2")
+    original = PixeltableMemoryStore._prepare_operation
+
+    def prepare(self: PixeltableMemoryStore, t: pxt.Table, op: MemoryOperation, *args: Any) -> Any:
+        receipt = original(self, t, op, *args)
+        if receipt is None and op.id == operation.id:
+            peer = PixeltableMemoryStore(table_name=self._table_name)
+            peer._write_sync("p.md", "c2", None, op)
+        return receipt
+
+    monkeypatch.setattr(PixeltableMemoryStore, "_prepare_operation", prepare)
+    outcome = await store.write("p.md", "c2", expected_version=None, operation=operation)
+    assert outcome.replayed
+    file = await store.read("p.md", max_chars=100)
+    assert file is not None
+    assert file.content == "c2"
+
+
+async def test_conflicted_mutation_keeps_prepared_receipt(
+    store: PixeltableMemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unrelated writer moved the path after we journaled. The conflict must surface,
+    # and the receipt must stay prepared (wedged for resolution, like FileStore) rather
+    # than being dropped into a silent retry.
+    operation = MemoryOperation(id="run-1:call-21", fingerprint="write:q.md:c2")
+    original = PixeltableMemoryStore._prepare_operation
+
+    def prepare(self: PixeltableMemoryStore, t: pxt.Table, op: MemoryOperation, *args: Any) -> Any:
+        receipt = original(self, t, op, *args)
+        if receipt is None and op.id == operation.id:
+            _insert_rows(
+                t,
+                [
+                    {
+                        "path": "q.md",
+                        "kind": "file",
+                        "content": "unrelated",
+                        "version": "other-v",
+                        "last_operation_id": None,
+                        "fingerprint": None,
+                        "existed": None,
+                    }
+                ],
+            )
+        return receipt
+
+    monkeypatch.setattr(PixeltableMemoryStore, "_prepare_operation", prepare)
+    with pytest.raises(MemoryConflictError):
+        await store.write("q.md", "c2", expected_version=None, operation=operation)
+    rows = store.table.where(store.table.path == f"__op__/{operation.id}").select(store.table.content).collect()
+    assert rows[0]["content"] is not None
+
+
+def test_compact_refuses_tables_with_user_columns_or_indexes() -> None:
+    name = f"test_pydantic_ai.compact_{uuid.uuid4().hex[:8]}"
+    pxt.create_dir("test_pydantic_ai", if_exists="ignore")
+    store = PixeltableMemoryStore(table_name=name)
+    t = store.table
+    t.add_computed_column(extra_col=t.kind)  # stored computed column a compact would drop
+    try:
+        with pytest.raises(ValueError, match="compact"):
+            store.compact()
+    finally:
+        pxt.drop_table(name, force=True, if_not_exists="ignore")

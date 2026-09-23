@@ -46,11 +46,6 @@ def _tools(root: str, *, max_rows: int = 20, max_chars: int = 8000):
     return Pixeltable(tables=[f"{root}.chunks"], max_rows=max_rows, max_chars=max_chars).get_toolset()
 
 
-def test_read_only_false_rejected() -> None:
-    with pytest.raises(ValueError, match="read_only"):
-        Pixeltable(read_only=False)
-
-
 def test_toolset_requires_explicit_allowlist() -> None:
     # None must not silently mean the whole catalog; that is an opt-in via ['*'].
     for tables in (None, []):
@@ -60,8 +55,8 @@ def test_toolset_requires_explicit_allowlist() -> None:
 
 
 def test_tables_required_and_star(catalog: str) -> None:
-    with pytest.raises(ValueError, match="tables"):
-        Pixeltable()
+    with pytest.raises(TypeError, match="tables"):
+        Pixeltable()  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="only entry"):
         Pixeltable(tables=["*", f"{catalog}.chunks"])
     names = Pixeltable(tables=["*"]).get_toolset().list_tables()["tables"]
@@ -173,22 +168,44 @@ def test_agent_from_spec_requires_custom_capability_types() -> None:
     assert loaded[0].tables == ["my_app.doc_chunks"]
 
 
-def test_combine_unions_allowlists_and_tightens_caps() -> None:
-    merged = Pixeltable.combine([Pixeltable(tables=["a"], max_rows=50), Pixeltable(tables=["b"], max_rows=5)])
-    assert merged.tables == ["a", "b"]
+def test_combine_intersects_allowlists_and_tightens_caps() -> None:
+    # tables is an access boundary, so a merge narrows: an entry survives only when every
+    # capability covers it ('*' and directory prefixes cover the entries beneath them).
+    merged = Pixeltable.combine(
+        [Pixeltable(tables=["a.b", "a.c"], max_rows=50), Pixeltable(tables=["a.b"], max_rows=5)]
+    )
+    assert merged.tables == ["a.b"]
     assert merged.max_rows == 5
 
-    star = Pixeltable.combine([Pixeltable(tables=["a"]), Pixeltable(tables=["*"])])
-    assert star.tables == ["*"]
+    star = Pixeltable.combine([Pixeltable(tables=["a.b"]), Pixeltable(tables=["*"])])
+    assert star.tables == ["a.b"]
+
+    covered = Pixeltable.combine([Pixeltable(tables=["d"]), Pixeltable(tables=["d.t1"])])
+    assert covered.tables == ["d.t1"]
+
+    with pytest.raises(ValueError, match="share no allowed tables"):
+        Pixeltable.combine([Pixeltable(tables=["a"]), Pixeltable(tables=["b"])])
 
     agent = Agent(
         "test",
-        capabilities=[Pixeltable(tables=["x"]), Pixeltable(tables=["y"], max_chars=10)],
+        capabilities=[Pixeltable(tables=["x"]), Pixeltable(tables=["x.y"], max_chars=10)],
     )
     caps = [cap for cap in agent.root_capability.capabilities if isinstance(cap, Pixeltable)]
     assert len(caps) == 1
-    assert caps[0].tables == ["x", "y"]
+    assert caps[0].tables == ["x.y"]
     assert caps[0].max_chars == 10
+
+
+def test_from_spec_positional_shorthand() -> None:
+    # {"Pixeltable": ["dir.tbl"]} passes the allowlist as the single positional argument.
+    cap = Pixeltable.from_spec(["my_app.doc_chunks"])
+    assert cap.tables == ["my_app.doc_chunks"]
+    spec = {"model": "test", "capabilities": [{"Pixeltable": ["my_app.doc_chunks"]}]}
+    agent = Agent.from_spec(spec, custom_capability_types=[Pixeltable])
+    loaded = [c for c in agent.root_capability.capabilities if isinstance(c, Pixeltable)]
+    assert loaded[0].tables == ["my_app.doc_chunks"]
+    with pytest.raises(TypeError):
+        Pixeltable.from_spec(["a.b"], tables=["c.d"])
 
 
 def test_tables_rejects_bad_entries() -> None:
@@ -266,3 +283,57 @@ def test_projection_errors_become_retries(catalog: str, monkeypatch: pytest.Monk
     monkeypatch.setattr(pxt.Table, "select", boom)
     with pytest.raises(ModelRetry, match="synthetic"):
         _tools(catalog).query_table(f"{catalog}.chunks")
+
+
+def test_where_rejects_wrong_value_type(catalog: str) -> None:
+    # A mistyped filter must fail loudly; silently returning [] would tell the model
+    # the data is absent.
+    tools = _tools(catalog)
+    with pytest.raises(ModelRetry, match="must be Int"):
+        tools.query_table(f"{catalog}.chunks", where={"pos": "open"})
+    with pytest.raises(ModelRetry, match="must be Int"):
+        tools.query_table(f"{catalog}.chunks", where={"pos": True})
+    with pytest.raises(ModelRetry, match="must be String"):
+        tools.query_table(f"{catalog}.chunks", where={"status": 5})
+    assert tools.query_table(f"{catalog}.chunks", where={"pos": 0})["rows"][0]["pos"] == 0
+
+
+def test_default_projection_skips_unstored_computed(catalog: str) -> None:
+    # Unstored computed columns recompute at query time; an LLM UDF would spend money.
+    chunks = pxt.get_table(f"{catalog}.chunks")
+    try:
+        chunks.add_computed_column(virtual=chunks.pos * 2, stored=False)
+        chunks.add_computed_column(materialized=chunks.pos * 3, stored=True)
+    except TypeError:
+        pytest.skip("pixeltable version has no stored= parameter")
+    result = _tools(catalog).query_table(f"{catalog}.chunks")
+    assert "virtual" not in result["rows"][0]
+    assert result["rows"][0]["materialized"] == 0
+    named = _tools(catalog).query_table(f"{catalog}.chunks", columns=["text", "virtual"])
+    assert named["rows"][0]["virtual"] == 0
+
+
+def test_similarity_score_does_not_shadow_real_column(catalog: str) -> None:
+    scored = pxt.create_table(f"{catalog}.scored", {"text": pxt.String, "score": pxt.Float})
+    scored.insert([{"text": "cats sit on mats", "score": 0.9}])
+    scored.add_embedding_index("text", string_embed=tiny_embed)
+    tools = Pixeltable(tables=[f"{catalog}.scored"]).get_toolset()
+    result = tools.similarity_search(f"{catalog}.scored", "cats", "text", limit=1)
+    row = result["rows"][0]
+    assert row["score"] == 0.9
+    assert "similarity_score" in row
+
+
+def test_duplicate_columns_are_deduplicated(catalog: str) -> None:
+    result = _tools(catalog).query_table(f"{catalog}.chunks", columns=["text", "text"])
+    assert result["rows"]
+    assert all(set(row) == {"text"} for row in result["rows"])
+
+
+def test_oversized_cell_is_truncated_not_dropped(catalog: str) -> None:
+    big = "x" * 4000
+    pxt.get_table(f"{catalog}.chunks").update({"text": big}, where=pxt.get_table(f"{catalog}.chunks").pos == 0)
+    result = _tools(catalog, max_chars=500).query_table(f"{catalog}.chunks", columns=["text"], where={"pos": 0})
+    assert result["rows"], "one oversized cell must not empty the result"
+    assert result["truncated"]
+    assert len(result["rows"][0]["text"]) < len(big)

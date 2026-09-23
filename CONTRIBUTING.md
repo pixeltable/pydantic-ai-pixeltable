@@ -35,6 +35,6 @@ ruff format .
 
 Releases are published to PyPI automatically when a GitHub Release is created.
 
-1. Bump version in `pydantic_ai_pixeltable/__init__.py` and `pyproject.toml`.
+1. Bump `version` in `pyproject.toml` (the package reads it from installed metadata).
 2. Commit and push to `main`.
-3. Create a GitHub Release with a `v*` tag (e.g. `v0.1.0`).
+3. Create a GitHub Release with a `v*` tag matching that version (e.g. `v0.2.0`); the release workflow verifies the match.

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/pixeltable/pydantic-ai-pixeltable/actions/workflows/ci.yml/badge.svg)](https://github.com/pixeltable/pydantic-ai-pixeltable/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/pydantic-ai-pixeltable.svg)](https://pypi.org/project/pydantic-ai-pixeltable/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/pixeltable/pydantic-ai-pixeltable/blob/main/LICENSE)
 
 [Pydantic AI Harness](https://github.com/pydantic/pydantic-ai-harness) integration for [Pixeltable](https://pixeltable.com/). Two independent layers:
 
@@ -29,7 +29,7 @@ Memory(FileStore)                          Memory(PixeltableMemoryStore)
                                                embedding indexes -> query_table, similarity_search
 ```
 
-Unique to this backend: memory rows are ordinary catalog rows. Add an embedding index on `content` for semantic recall, or query them like any other table.
+Unique to this backend: memory rows are ordinary catalog rows. `store.search` stays lexical (the Harness contract), but through `store.table` you can add an embedding index on `content` and run Pixeltable similarity queries over memory, or join it with the rest of the catalog.
 
 ## Installation
 
@@ -39,36 +39,28 @@ pip install pydantic-ai-pixeltable
 
 ## Quick Start
 
-The usual pairing is FileStore Memory (a notebook you can open) plus Pixeltable catalog tools (a corpus you can search). Search inside Memory is lexical; `similarity_search` on catalog tables uses the embedding index.
+Memory in the catalog, plus read-only tools over the tables you already have:
 
 ```python
 from pydantic_ai import Agent
 from pydantic_ai_harness import Memory, ToolOutputLimits
-from pydantic_ai_harness.memory import FileStore
-from pydantic_ai_pixeltable import Pixeltable
+from pydantic_ai_pixeltable import Pixeltable, PixeltableMemoryStore
 
 agent = Agent(
-    "openai:gpt-4o-mini",
+    "anthropic:claude-sonnet-4-6",
     capabilities=[
-        Memory(FileStore(".agent-memory")),
-        Pixeltable(tables=["my_app.doc_chunks"], read_only=True),
+        Memory(PixeltableMemoryStore(table_name="harness.memory")),
+        Pixeltable(tables=["my_app.doc_chunks"]),
         ToolOutputLimits(),
     ],
 )
 ```
 
-Use `PixeltableMemoryStore` when the notebook should live in the catalog:
+Prefer `FileStore` (or `PostgresMemoryStore`) when the notebook does not need to live in the catalog; the choice is per project.
 
-```python
-from pydantic_ai_harness import Memory
-from pydantic_ai_pixeltable import PixeltableMemoryStore
+`tables` is a required allowlist of table paths or directory prefixes. Pass `tables=["*"]` to allow the whole catalog, including the memory table and its `__op__` receipt payloads.
 
-Memory(PixeltableMemoryStore(table_name="harness.memory"))
-```
-
-`tables` is a required allowlist of table paths or directory prefixes. Pass `tables=["*"]` to allow the whole catalog.
-
-Two `Pixeltable(...)` instances share `id="pixeltable"` and merge. [`pydantic-ai-chdb`](https://ai.pydantic.dev/capabilities/third-party/) also registers `list_tables` and `describe_table`; wrap one side in [`PrefixTools`](https://ai.pydantic.dev/capabilities/prefix-tools/) when you pair them.
+Two `Pixeltable(...)` instances share `id="pixeltable"` and merge by narrowing: an entry survives only when every capability covers it, and a disjoint merge raises. [`pydantic-ai-chdb`](https://ai.pydantic.dev/capabilities/third-party/) also registers `list_tables` and `describe_table`; wrap one side in [`PrefixTools`](https://ai.pydantic.dev/capabilities/prefix-tools/) when you pair them.
 
 ## Catalog tools
 
@@ -76,8 +68,7 @@ Two `Pixeltable(...)` instances share `id="pixeltable"` and merge. [`pydantic-ai
 
 - `query_table` filters with equality only (`{"status": "open"}`); media, array, and binary columns reject non-null filters.
 - `similarity_search` calls `column.similarity(string=query)` and needs an embedding index on that column.
-- Output is bounded by `max_rows` and `max_chars`; the minimal `{"table", "rows", "truncated"}` envelope is always returned, even when `max_chars` is set below its size. Default columns skip media, array, and binary; a named media column returns a file URL, not a blob.
-- `read_only=False` is not implemented.
+- Output is bounded by `max_rows` and `max_chars`; the minimal `{"table", "rows", "truncated"}` envelope is always returned, even when `max_chars` is set below its size. Default columns skip media, array, binary, and computed columns that are not stored (they would recompute per query); a named media column returns a file URL, not a blob.
 
 Declare the tables and index on a `TableModel` in `app.py`; `pxt schema update` creates them:
 
@@ -114,7 +105,7 @@ A notebook or REPL can still call `create_table`, `create_view`, and `add_embedd
 ```python
 agent = Agent.from_spec(
     {
-        "model": "openai:gpt-4o-mini",
+        "model": "anthropic:claude-sonnet-4-6",
         "capabilities": [{"Pixeltable": {"tables": ["my_app.doc_chunks"]}}],
     },
     custom_capability_types=[Pixeltable],
@@ -129,8 +120,9 @@ Without `custom_capability_types=[Pixeltable]`, `Agent.from_spec` does not know 
 - Each path is one row (`kind == "file"`); operation receipts are rows under `__op__/`. Path roots `__meta__` and `__op__` are reserved.
 - Compare-and-set: `expected_version` must equal the row's version. Versions are unique UUID strings, not monotonic. A stale version raises `MemoryConflictError`.
 - Operation receipts are journaled `__op__` rows: the intended mutation is recorded before it is applied, so a mid-write crash rolls forward or replays cleanly instead of double-applying.
-- `store.compact()` rebuilds the table from live rows. Pixeltable keeps old row versions for updates and deletes, so compaction is the only way to reclaim storage. Run it with writers paused.
+- `store.compact()` rebuilds the table from live rows. Pixeltable keeps old row versions for updates and deletes, so compaction is the only way to reclaim storage. Run it with writers paused; it refuses tables with user-added columns or indexes.
 - `Memory(PixeltableMemoryStore)` is Python-only. Harness YAML backends are `memory`, `file`, and `sqlite`.
+- This package emits no telemetry of its own; the `memory.*` spans come from the Harness `Memory` capability.
 
 ### Escape hatch: `.table`
 
@@ -141,8 +133,6 @@ t.where(t.kind == "file").select(t.path, t.content, t.version).collect()
 ```
 
 Use `.table` to query. A raw `t.update` of `content` is not a Memory write: the version does not change, and the next compare-and-set can overwrite it.
-
-Tables created by pre-release revisions with an `Int` `version` column are rejected on first use; drop and recreate them.
 
 ## Measured results
 
@@ -156,8 +146,6 @@ Pixeltable 0.7.8 on embedded PostgreSQL, ~20k rows per test, laptop hardware (`p
 | `query_table` equality filter, limit 20 over 20k rows | ~10 ms |
 | `similarity_search` top-3 over 20k indexed rows | ~8 ms |
 | Embedding index build over 20k rows | ~2.3 s |
-
-Against the previous revision: cached table handles remove one catalog lookup per call, catalog tools fetch metadata once per call instead of twice, and UUID versions remove the shared generation-row update, cutting contended CAS write time ~20% (1.26 s to 1.02 s for 200 attempts).
 
 ## Development
 

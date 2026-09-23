@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, TypedDict, cast
 
 import pixeltable as pxt
 from pydantic_ai.exceptions import ModelRetry
@@ -14,6 +14,35 @@ from pydantic_ai_pixeltable._types import column_base
 
 _MEDIA = frozenset({"Image", "Video", "Audio", "Document"})
 ALL_TABLES = "*"
+
+
+class TableNames(TypedDict):
+    tables: list[str]
+
+
+class RowsResult(TypedDict):
+    table: str
+    rows: list[dict[str, Any]]
+    truncated: bool
+
+
+class TableDescription(TypedDict):
+    table: str
+    kind: str | None
+    comment: str | None
+    columns: list[dict[str, Any]]
+    indexes: list[dict[str, Any]]
+
+
+# Accepted Python value types per column base type for `where` equality filters.
+_WHERE_VALUE_TYPES: dict[str, type | tuple[type, ...]] = {
+    "String": str,
+    "Int": int,
+    "Float": (int, float),
+    "Bool": bool,
+    "Timestamp": str,
+    "Date": str,
+}
 
 
 def _norm(path: str) -> str:
@@ -61,17 +90,31 @@ def _row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: _cell(value) for key, value in row.items()}
 
 
-def _bounded_payload(table: str, rows: list[dict[str, Any]], *, has_more: bool, max_chars: int) -> dict[str, Any]:
-    kept = list(rows)
+def _bounded_payload(table: str, rows: list[dict[str, Any]], *, has_more: bool, max_chars: int) -> RowsResult:
+    kept = [dict(row) for row in rows]
     truncated = has_more
     while True:
-        payload = {"table": table, "rows": kept, "truncated": truncated}
+        payload = RowsResult(table=table, rows=kept, truncated=truncated)
         encoded = json.dumps(payload, ensure_ascii=False)
         if len(encoded) <= max_chars:
             return payload
         if not kept:
-            return {"table": table, "rows": [], "truncated": True}
-        kept.pop()
+            return RowsResult(table=table, rows=[], truncated=True)
+        # Prefer trimming the longest string cell over dropping the whole row, so one
+        # oversized value cannot empty the result.
+        longest_len = 0
+        longest_row = longest_key = None
+        for index, row in enumerate(kept):
+            for key, value in row.items():
+                if isinstance(value, str) and len(value) > longest_len:
+                    longest_len, longest_row, longest_key = len(value), index, key
+        if longest_len == 0 or longest_row is None or longest_key is None:
+            kept.pop()
+            truncated = True
+            continue
+        cut = max(longest_len - (len(encoded) - max_chars) - 3, 0)
+        value = kept[longest_row][longest_key]
+        kept[longest_row][longest_key] = f"{value[:cut]}..." if cut else ""
         truncated = True
 
 
@@ -91,7 +134,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         self.add_function(self.query_table, name="query_table")
         self.add_function(self.similarity_search, name="similarity_search")
 
-    def list_tables(self) -> dict[str, list[str]]:
+    def list_tables(self) -> TableNames:
         """List Pixeltable tables this agent may use.
 
         Returns:
@@ -101,13 +144,13 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             tables = pxt.list_tables()
         except pxt.Error as exc:
             raise ModelRetry(str(exc)) from exc
-        return {"tables": sorted(_norm(path) for path in tables if _allowed(path, self._tables))}
+        return TableNames(tables=sorted(_norm(path) for path in tables if _allowed(path, self._tables)))
 
-    def describe_table(self, table: str) -> dict[str, Any]:
+    def describe_table(self, table: str) -> TableDescription:
         """Describe a table's columns and indexes.
 
         Args:
-            table: Pixeltable table path (for example ``my_app.doc_chunks``).
+            table: Pixeltable table path (for example `my_app.doc_chunks`).
 
         Returns:
             Kind, comment, columns, and indexes.
@@ -116,19 +159,19 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         metadata = self._metadata(table, t)
         # pixeltable renamed the metadata key "indices" to "indexes" in 0.7.x.
         indexes = metadata.get("indexes") or metadata.get("indices") or {}
-        return {
-            "table": _norm(metadata["path"]),
-            "kind": metadata.get("kind"),
-            "comment": metadata.get("comment"),
-            "columns": [
+        return TableDescription(
+            table=_norm(metadata["path"]),
+            kind=metadata.get("kind"),
+            comment=metadata.get("comment"),
+            columns=[
                 {"name": info.get("name"), "type": info.get("type_"), "is_computed": info.get("is_computed", False)}
                 for info in metadata["columns"].values()
             ],
-            "indexes": [
+            indexes=[
                 {"name": info["name"], "index_type": info["index_type"], "columns": info["columns"]}
                 for info in indexes.values()
             ],
-        }
+        )
 
     def query_table(
         self,
@@ -136,19 +179,20 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         columns: list[str] | None = None,
         where: dict[str, Any] | None = None,
         limit: int = 10,
-    ) -> dict[str, Any]:
-        """Select rows from a table. ``where`` is equality only (``{"status": "open"}``).
+    ) -> RowsResult:
+        """Select rows from a table. `where` is equality only (`{"status": "open"}`).
 
         Args:
             table: Pixeltable table path.
-            columns: Columns to return. Omit to skip media, array, and binary.
-                A named media column is returned as a file URL.
+            columns: Columns to return. Omit to skip media, array, binary, and
+                computed columns that are not stored. A named media column is
+                returned as a file URL.
             where: Equality filters mapping column name to value. Media, array, and
-                binary columns reject non-null filters; ``None`` matches null rows.
+                binary columns reject non-null filters; `None` matches null rows.
             limit: Maximum rows to return, capped by the capability.
 
         Returns:
-            Matching rows, with ``truncated`` set when the row or character cap applied.
+            Matching rows, with `truncated` set when the row or character cap applied.
         """
         t = self._open_table(table)
         metadata = self._metadata(table, t)
@@ -167,7 +211,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         columns: list[str] | None = None,
         limit: int = 5,
         idx: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> RowsResult:
         """Nearest-neighbor search on a column that has an embedding index.
 
         Args:
@@ -179,7 +223,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             idx: Embedding index name. Required when the column has more than one index.
 
         Returns:
-            Rows ordered by similarity, each with a ``score`` field.
+            Rows ordered by similarity, each with a `score` field.
         """
         if not query.strip():
             raise ModelRetry("similarity_search query must be non-empty")
@@ -191,11 +235,15 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         selected = self._default_columns(metadata) if columns is None else list(columns)
         if column not in selected and not _is_skipped_type(column_md[column]["type_"]):
             selected = [column, *[name for name in selected if name != column]]
+        # A real column named `score` must not be shadowed by the similarity score.
+        score_name = "score"
+        while score_name in column_md:
+            score_name = f"similarity_{score_name}"
         try:
             search = (
                 t[column].similarity(string=query, idx=idx) if idx is not None else t[column].similarity(string=query)
             )
-            query_obj = self._project(t, selected, metadata, score=search).order_by(search, asc=False)
+            query_obj = self._project(t, selected, metadata, **{score_name: search}).order_by(search, asc=False)
             return self._collect(table, query_obj, limit)
         except pxt.Error as exc:
             self._handles.pop(table, None)
@@ -203,7 +251,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
 
     def _metadata(self, table: str, t: pxt.Table) -> dict[str, Any]:
         try:
-            metadata = t.get_metadata()
+            metadata = cast(dict[str, Any], t.get_metadata())
         except pxt.Error as exc:
             self._handles.pop(table, None)
             raise ModelRetry(str(exc)) from exc
@@ -221,6 +269,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
             t = pxt.get_table(table)
         except pxt.Error as exc:
             raise ModelRetry(f"Cannot open table {table!r}: {exc}") from exc
+        assert t is not None  # if_not_exists='error' raises instead of returning None
         self._handles[table] = t
         return t
 
@@ -229,6 +278,10 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         for name, info in metadata["columns"].items():
             type_ = info["type_"]
             if _is_media_type(type_) or _is_skipped_type(type_):
+                continue
+            # A computed column that is not stored recomputes at query time; an LLM UDF
+            # would spend money on every call.
+            if info.get("is_computed") and not info.get("is_stored"):
                 continue
             columns.append(name)
         return columns
@@ -239,7 +292,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         if columns is None:
             names = self._default_columns(metadata)
         else:
-            names = list(columns)
+            names = list(dict.fromkeys(columns))
             if not names:
                 raise ModelRetry("query_table needs at least one column")
         items: list[Any] = []
@@ -274,6 +327,14 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
                 raise ModelRetry(f"Column {name!r} does not support equality filters. Call describe_table.")
             if value is not None and not isinstance(value, (str, int, float, bool)):
                 raise ModelRetry(f"where value for {name!r} must be a scalar, got {type(value).__name__}")
+            base = column_base(type_)
+            expected = _WHERE_VALUE_TYPES.get(base)
+            if (
+                value is not None
+                and expected is not None
+                and (not isinstance(value, expected) or (isinstance(value, bool) and base != "Bool"))
+            ):
+                raise ModelRetry(f"where value for {name!r} must be {base}, got {type(value).__name__}")
             try:
                 clause = t[name] == value
                 pred = clause if pred is None else pred & clause
@@ -284,7 +345,7 @@ class PixeltableToolset(FunctionToolset[AgentDepsT]):
         except (pxt.Error, TypeError, ValueError) as exc:
             raise ModelRetry(str(exc)) from exc
 
-    def _collect(self, table: str, query: Any, limit: int) -> dict[str, Any]:
+    def _collect(self, table: str, query: Any, limit: int) -> RowsResult:
         if limit < 1:
             raise ModelRetry("limit must be at least 1")
         n = min(limit, self._max_rows)
