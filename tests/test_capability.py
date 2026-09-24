@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+import warnings
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -374,3 +375,11 @@ def test_version_handles_are_refused(catalog: str) -> None:
         tools = Pixeltable(tables=tables).get_toolset()
         with pytest.raises(ModelRetry, match="allowlist"):
             tools.query_table(f"{catalog}.chunks:1", columns=["text"])
+
+
+def test_tool_return_schemas_build_without_warnings() -> None:
+    # typing.TypedDict has no return schema before Python 3.12; pydantic warns and falls back to an
+    # unconstrained schema, so the model loses the result shape.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        Pixeltable(tables=["my_app.doc_chunks"]).get_toolset()

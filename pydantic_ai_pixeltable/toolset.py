@@ -6,12 +6,13 @@ import json
 import uuid
 from collections.abc import Callable
 from datetime import date, datetime
-from typing import Any, TypedDict, cast
+from typing import Any, cast
 
 import pixeltable as pxt
 from pydantic_ai.exceptions import ModelRetry
 from pydantic_ai.tools import AgentDepsT
 from pydantic_ai.toolsets import FunctionToolset
+from typing_extensions import TypedDict  # typing.TypedDict has no return schema before Python 3.12
 
 from pydantic_ai_pixeltable._types import column_base
 
