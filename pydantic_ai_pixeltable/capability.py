@@ -73,7 +73,8 @@ class Pixeltable(AbstractCapability[AgentDepsT]):
             raise ValueError(f"max_chars must be at least 1, got {self.max_chars}")
         if isinstance(self.tables, str):
             raise ValueError("tables must be a list of paths, not a string")
-        cleaned = [entry.replace("/", ".") for entry in self.tables if entry]
+        # Lowercased like Pixeltable's identifiers, so merging and the instructions match the catalog.
+        cleaned = [entry.replace("/", ".").lower() for entry in self.tables if entry]
         if not cleaned:
             raise ValueError("tables must be a non-empty allowlist, or ['*'] for the whole catalog")
         if ALL_TABLES in cleaned and cleaned != [ALL_TABLES]:

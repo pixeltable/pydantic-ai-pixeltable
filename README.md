@@ -43,9 +43,9 @@ print(agent.run_sync("Can I expense a 75 EUR dinner? Remember that I travel mont
 
 ## Catalog tools
 
-- `tables` is a required allowlist of table paths or directory prefixes. `["*"]` allows the whole catalog, including a memory table. A view inside an allowed directory exposes its base table's columns. Version handles (`tbl:3`) are refused, since old versions keep deleted rows and dropped columns.
+- `tables` is a required allowlist of table paths or directory prefixes, lowercased like Pixeltable's own names. `["*"]` allows the whole catalog, including a memory table. A view inside an allowed directory exposes its base table's columns. Version handles (`tbl:3`) are refused, since old versions keep deleted rows and dropped columns.
 - `similarity_search` needs an embedding index on the column. `query_table` filters by equality only; timestamp, date, and UUID values are ISO strings.
-- Default columns skip media, array, binary, and unstored computed columns, which recompute on every read (possibly a model call) and also reject filters. A named media column returns a file URL.
+- Default columns skip media, array, binary, and unstored computed columns, which recompute on every read (possibly a model call) and also reject filters; naming one in `columns` runs it for each fetched row (at most `max_rows + 1` per call). A named media column returns a file URL.
 - `max_rows` (20) and `max_chars` (8000) bound every result. An oversized string is cut to end in `...` and any other oversized value becomes `null`; the `{"table", "rows", "truncated"}` envelope is always returned.
 - Two instances on one agent share `id="pixeltable"` and merge by intersecting their allowlists; a disjoint merge raises. A capability passed to a single run replaces the agent's, so it can widen access.
 - [`pydantic-ai-chdb`](https://github.com/chdb-io/pydantic-ai-chdb) registers the same `list_tables` and `describe_table` names; wrap one in [`PrefixTools`](https://ai.pydantic.dev/capabilities/prefix-tools/) to use both.
@@ -53,7 +53,7 @@ print(agent.run_sync("Can I expense a 75 EUR dinner? Remember that I travel mont
 
 ## Memory store
 
-- The table is created on first use. Each memory path is a `kind == "file"` row, and operation receipts are `__op__/` rows, so the roots `__op__` and `__meta__` are reserved. Paths are at most 255 characters.
+- The table is created on first use. Each memory path is a `kind == "file"` row, and operation receipts are `__op__/` rows, so the roots `__op__` and `__meta__` are reserved. Paths are at most 255 characters and operation ids at most 248.
 - Writes are compare-and-set on a UUID version. The intent is journaled before the write, so a crash rolls forward on replay instead of applying twice.
 - `store.table` is an ordinary table: query it, join it, or add an embedding index on `content`. `search_memory` stays lexical, as in every Harness store. A direct `t.update` is not a Memory write and leaves the version unchanged.
 - Pixeltable keeps every row version and receipts are never pruned, so the table grows with history.

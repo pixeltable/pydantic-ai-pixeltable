@@ -616,3 +616,39 @@ async def test_withdraw_never_drops_an_intent_a_peer_applied(
     current = await store.read("w.md", max_chars=100)
     assert current is not None
     assert current.content == ("other\n" if mutation == "write" else "recreated\n")
+
+
+async def test_conflicted_delete_is_not_credited_with_another_delete(
+    store: PixeltableMemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unrelated writer deletes the path after we journal. The file is gone, but our delete
+    # removed nothing and no peer claimed the intent, so only one of the two deletes succeeds.
+    base = await store.write("g.md", "base", expected_version=None)
+    operation = MemoryOperation(id="run-1:call-32", fingerprint="delete:g.md")
+    other = PixeltableMemoryStore(table_name=store._table_name)
+    original = PixeltableMemoryStore._prepare_operation
+
+    def prepare(self: PixeltableMemoryStore, t: pxt.Table, op: MemoryOperation, *args: Any) -> Any:
+        receipt = original(self, t, op, *args)
+        if receipt is None and self is store:
+            assert other._delete_sync("g.md", base.version, None).existed
+        return receipt
+
+    monkeypatch.setattr(PixeltableMemoryStore, "_prepare_operation", prepare)
+    with pytest.raises(MemoryConflictError, match="changed during operation"):
+        await store.delete("g.md", expected_version=base.version, operation=operation)
+    monkeypatch.undo()
+    assert await store.get_operation(operation) is None
+
+
+async def test_operation_ids_are_capped_below_the_receipt_key(store: PixeltableMemoryStore) -> None:
+    # Receipts live at `__op__/<id>` under the same key, so ids stop 7 characters sooner than paths.
+    longest = MemoryOperation(id="i" * 248, fingerprint="write:a.md:x")
+    assert not (await store.write("a.md", "x", expected_version=None, operation=longest)).replayed
+    too_long = MemoryOperation(id="i" * 249, fingerprint="write:b.md:x")
+    with pytest.raises(ValueError, match="operation id exceeds 248"):
+        await store.write("b.md", "x", expected_version=None, operation=too_long)
+    with pytest.raises(ValueError, match="operation id exceeds 248"):
+        await store.delete("a.md", expected_version=None, operation=too_long)
+    with pytest.raises(ValueError, match="operation id exceeds 248"):
+        await store.get_operation(too_long)

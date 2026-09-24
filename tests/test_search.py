@@ -109,3 +109,15 @@ async def test_search_bounds_each_file_and_ignores_namespace_prefix(store: Pixel
     assert namespace_result.matches == []
     visible = await store.search(prefix, "target", limit=10, max_files=10, max_chars=20, max_file_chars=100)
     assert [match.path for match in visible.matches] == [f"{prefix}note.md"]
+
+
+async def test_list_paths_and_search_keep_code_point_order(store: PixeltableMemoryStore) -> None:
+    paths = ["b.md", "a.md", "B.md", "_x.md", "-y.md"]
+    for path in paths:
+        await store.write(path, "alpha", expected_version=None)
+    # Sorted in Python, so the order and the files a bound keeps do not depend on the collation.
+    assert await store.list_paths(limit=10) == sorted(paths)
+    assert await store.list_paths(limit=2) == sorted(paths)[:2]
+    found = await store.search("", "alpha", limit=10, max_files=2, max_chars=200, max_file_chars=100)
+    assert [match.path for match in found.matches] == sorted(paths)[:2]
+    assert found.truncated

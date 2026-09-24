@@ -383,3 +383,13 @@ def test_tool_return_schemas_build_without_warnings() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         Pixeltable(tables=["my_app.doc_chunks"]).get_toolset()
+
+
+def test_allowlist_folds_case_like_pixeltable(catalog: str) -> None:
+    # Pixeltable lowercases identifiers, so a differently cased entry names the same table.
+    assert Pixeltable(tables=["My_App/Doc_Chunks"]).tables == ["my_app.doc_chunks"]
+    tools = Pixeltable(tables=[f"{catalog.upper()}.Chunks"]).get_toolset()
+    assert tools.list_tables()["tables"] == [f"{catalog}.chunks"]
+    assert tools.describe_table(f"{catalog}.CHUNKS")["table"] == f"{catalog}.chunks"
+    with pytest.raises(ModelRetry, match="allowlist"):
+        tools.describe_table(f"{catalog.upper()}.OTHER")
